@@ -11,40 +11,65 @@ import tempfile
 import sys
 from zipfile import ZipFile, ZIP_DEFLATED
 
-# === CONFIG ===
-NEGOCIOS_DIR = Path(r"C:\Tryd7\workspace\replay\import\WDO&DOL\negocios")
-IMPORT_DIR   = Path(r"C:\Tryd7\workspace\replay\import\WDO&DOL")
-DEST_ROOT    = Path(r"E:\Mercado BMF&BOVESPA bk\tryd\2024\Extraidos DOLWDO")
+# ================== CONFIG GERAL ==================
+YEAR = 2018
+MARKET_PAIR = "INDWIN"   # "DOLWDO" ou "WININD"
+SAVE_AND_ZIP_DAT = False  # True = copiar e compactar .dat | False = não salvar .dat
+
+# Mapeia nomes de pastas e símbolos aceitos por par de mercado
+MARKET_CFG = {
+    "DOLWDO": {
+        "import_folder": r"C:\Tryd7\workspace\replay\import\WDO&DOL",
+        "dest_root":     fr"E:\Mercado BMF&BOVESPA\tryd\{YEAR}\Extraidos DOLWDO",
+        "symbols": ("dol", "wdo")
+    },
+    "INDWIN": {
+        "import_folder": r"C:\Tryd7\workspace\replay\import\WIN&IND",
+        "dest_root":     fr"E:\Mercado BMF&BOVESPA\tryd\{YEAR}\Extraidos INDWIN",
+        "symbols": ("win", "ind")
+    }
+}
+
+if MARKET_PAIR not in MARKET_CFG:
+    raise ValueError("MARKET_PAIR deve ser 'DOLWDO' ou 'INDWIN'.")
+
+IMPORT_DIR = Path(MARKET_CFG[MARKET_PAIR]["import_folder"])
+DEST_ROOT  = Path(MARKET_CFG[MARKET_PAIR]["dest_root"])
+SYMS       = MARKET_CFG[MARKET_PAIR]["symbols"]
+
+NEGOCIOS_DIR = IMPORT_DIR / "negocios"
+
 SEVEN_ZIP_EXE = r"C:\Program Files\7-Zip\7z.exe"  # ou "7z" se estiver no PATH
 
 # Controle de sobrescrita
 OVERWRITE_COPY = False     # copiar por cima?
 OVERWRITE_ZIP  = True      # recriar .zip se já existir?
 
-# === CHECKS ===
+# ================== CHECKS ==================
 if not Path(SEVEN_ZIP_EXE).exists():
     print(f"❌ 7z.exe não encontrado em: {SEVEN_ZIP_EXE}")
     sys.exit(1)
 
 DEST_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Regex
-pat_gz    = re.compile(r"^(?P<ymd>\d{8})_(?P<kind>(dol|wdo).*)$", re.IGNORECASE)  # .gz relevantes
-pat_repl  = re.compile(r"^tryd_replay_(?P<ymd>\d{8})\.0\.0\.dat$", re.IGNORECASE) # replays
+# Regex (compila com símbolos do par selecionado)
+# Ex.: 20240110_dolm18.gz, 20180430_wdom18.gz, 20240110_ind12.gz, etc.
+pat_gz   = re.compile(rf"^(?P<ymd>\d{{8}})_(?P<kind>({'|'.join(SYMS)}).*)$", re.IGNORECASE)
+pat_repl = re.compile(r"^tryd_replay_(?P<ymd>\d{8})\.0\.0\.dat$", re.IGNORECASE)
 
-# ------------- CONFIGS BÁSICAS -------------
-WINDOW_TITLE_CONTAINS = "Preferências"      # pedaço do título da janela do Tryd (ajuste se preciso)
-PLAY_STOP_POS = (3327, 141)                 # <-- COLOQUE AQUI as coords do botão Play/Parar (x,y)
-LIST_CLICK_POS = (2787, 121)                 # <-- COLOQUE AQUI um ponto dentro da lista (x,y)
-N_ITENS_PARA_SUBIR = 1                      # normalmente 1 (arquivo logo acima)
-ESPERA_REPLAY_INICIAR = 15                  # segundos até mandar Enter no pop-up
-FATOR_SCROLL = 0                            # ajuste se quiser rolar para cima entre execuções (0 = não rola)
-REPETICOES = 250                             # quantos arquivos processar (ou use while True)
+# ------------- CONFIGS DE AUTOMAÇÃO -------------
+WINDOW_TITLE_CONTAINS = "Preferências"      # Ajuste conforme a janela do Tryd
+PLAY_STOP_POS = (3327, 141)                 # coords do botão Play/Parar (x,y)
+LIST_CLICK_POS = (2787, 121)                # ponto dentro da lista (x,y)
+N_ITENS_PARA_SUBIR = 1                      # geralmente 1 (arquivo logo acima)
+ESPERA_REPLAY_INICIAR = 20                  # segundos até mandar Enter no pop-up
+FATOR_SCROLL = 0                            # 0 = não rola
+REPETICOES = 150                            # quantos arquivos processar
 
-gui.FAILSAFE = True     # mover mouse para canto superior esquerdo aborta
-gui.PAUSE = 0.15        # pequeno intervalo entre ações
+gui.FAILSAFE = True     # mover mouse p/ canto sup-esq aborta
+gui.PAUSE = 0.15        # intervalo entre ações
 
-# ------------- SUA FUNÇÃO -------------
+# ------------- FUNÇÕES -------------
 def ymd_to_dash(ymd: str) -> str:
     return datetime.strptime(ymd, "%Y%m%d").strftime("%Y-%m-%d")
 
@@ -59,7 +84,7 @@ def copy2(src: Path, dst: Path) -> bool:
     return True
 
 def zip_then_cleanup(dat_path: Path):
-    """Compacta dat_path para .zip na mesma pasta, remove o .dat e .gz da pasta."""
+    """Compacta dat_path p/ .zip na mesma pasta, remove o .dat e .gz da pasta."""
     if not dat_path.exists():
         print(f"⚠️  .dat não encontrado para compactar: {dat_path}")
         return
@@ -78,16 +103,13 @@ def zip_then_cleanup(dat_path: Path):
             return
 
     try:
-        # Compactar
         with ZipFile(zip_path, "w", compression=ZIP_DEFLATED, compresslevel=6) as zf:
             zf.write(dat_path, arcname=dat_path.name)
         print(f"🗜️  Compactado: {dat_path.name} → {zip_path.name}")
 
-        # Remover o .dat
         dat_path.unlink()
         print(f"🧹 Removido .dat original: {dat_path}")
 
-        # Remover quaisquer .gz nessa pasta
         for gz in dat_path.parent.glob("*.gz"):
             try:
                 gz.unlink()
@@ -106,6 +128,16 @@ def extract_gz(gz: Path, out_dir: Path):
         print("❌ Erro 7z:", proc.stderr or proc.stdout)
         raise RuntimeError(f"Falha 7z em {gz}")
 
+def cleanup_dest_folder(folder: Path):
+    """Remove .gz e .dat da pasta destino."""
+    for ext in ("*.gz", "*.dat"):
+        for f in folder.glob(ext):
+            try:
+                f.unlink()
+                print(f"🧹 Removido {f.name}")
+            except Exception as e:
+                print(f"⚠️  Falha ao remover {f.name}: {e}")
+
 def process_gz():
     gz_files = sorted(NEGOCIOS_DIR.glob("*.gz"))
     print(f"🔎 Encontrados {len(gz_files)} .gz em {NEGOCIOS_DIR}\n")
@@ -117,7 +149,7 @@ def process_gz():
         for gz in gz_files:
             m = pat_gz.match(gz.stem)  # sem .gz
             if not m:
-                print(f"⚠️  Ignorando (fora do padrão dol/wdo): {gz.name}")
+                print(f"⚠️  Ignorando (fora do padrão {SYMS[0]}/{SYMS[1]}): {gz.name}")
                 continue
 
             ymd = m.group("ymd")
@@ -135,18 +167,22 @@ def process_gz():
             for f in TMP.iterdir():
                 if not (f.is_file() and f.name.startswith(ymd + "_")):
                     continue
+
+                # normaliza nome com base no símbolo (dol/wdo ou win/ind)
                 suffix = f.name.split("_", 1)[1].lower()
-                if suffix.startswith("dol"):
-                    norm = f"{ymd}_dol"
-                elif suffix.startswith("wdo"):
-                    norm = f"{ymd}_wdo"
-                else:
+                norm_sym = None
+                for s in SYMS:
+                    if suffix.startswith(s):
+                        norm_sym = s
+                        break
+                if norm_sym is None:
                     # ex.: di1f21 ou outros — ignorar
                     continue
+
+                norm = f"{ymd}_{norm_sym}"
                 copy2(f, dest_folder / norm)
 
 def process_replays():
-    """Copia TODOS os tryd_replay_YYYYMMDD.0.0.dat para suas pastas e, após copiar, zipa e limpa."""
     replay_files = sorted(IMPORT_DIR.glob("tryd_replay_*.0.0.dat"))
     if not replay_files:
         print(f"⚠️  Nenhum replay encontrado em {IMPORT_DIR}")
@@ -163,10 +199,13 @@ def process_replays():
         dest_folder = DEST_ROOT / yyyy_mm_dd
         dst_dat = dest_folder / rp.name
 
-        did_copy = copy2(rp, dst_dat)
-        # Só compacta/limpa se de fato copiou (evita apagar um .dat antigo que você quis manter)
-        if did_copy:
-            zip_then_cleanup(dst_dat)
+        if SAVE_AND_ZIP_DAT:
+            did_copy = copy2(rp, dst_dat)
+            if did_copy:
+                zip_then_cleanup(dst_dat)
+        else:
+            # não salva, mas limpa qualquer .dat/.gz do destino
+            cleanup_dest_folder(dest_folder)
 
 def minha_funcao_de_processamento():
     """
@@ -177,13 +216,11 @@ def minha_funcao_de_processamento():
     process_replays()
     print("\n🏁 Finalizado.")
 
-
 # ------------- HELPER: focar janela do Tryd -------------
 def focar_janela_tryd():
     wins = [w for w in gw.getAllWindows() if WINDOW_TITLE_CONTAINS.lower() in w.title.lower()]
     if not wins:
         raise RuntimeError(f"Janela com '{WINDOW_TITLE_CONTAINS}' não encontrada. Abra a tela de Replay/Preferências.")
-    # pegue a mais recente/visível
     win = wins[0]
     if win.isMinimized:
         win.restore()
@@ -195,7 +232,6 @@ def clicar_play_ou_parar():
     gui.click(PLAY_STOP_POS)
 
 def enviar_enter_para_popup():
-    # Fecha o diálogo de mapeamento de papéis (OK com foco). Envie Enter algumas vezes, por garantia.
     for _ in range(2):
         gui.press("enter")
         time.sleep(0.2)
@@ -205,7 +241,6 @@ def focar_lista():
 
 def selecionar_item_acima(n=1):
     focar_lista()
-    # Se quiser garantir visibilidade, role para cima um pouco
     if FATOR_SCROLL:
         gui.scroll(FATOR_SCROLL)  # positivo = rola para cima
     for _ in range(n):
@@ -213,6 +248,12 @@ def selecionar_item_acima(n=1):
 
 # ------------- LOOP PRINCIPAL -------------
 def main():
+    print(f"🧭 Modo: {MARKET_PAIR} | Símbolos: {SYMS}")
+    print(f"📁 IMPORT_DIR: {IMPORT_DIR}")
+    print(f"📁 NEGOCIOS_DIR: {NEGOCIOS_DIR}")
+    print(f"📁 DEST_ROOT: {DEST_ROOT}")
+    print(f"💾 SAVE_AND_ZIP_DAT: {SAVE_AND_ZIP_DAT}\n")
+
     focar_janela_tryd()
 
     for i in range(REPETICOES):
