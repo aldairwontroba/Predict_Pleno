@@ -225,7 +225,7 @@ def _stats_list(lst: List[float]) -> Dict[str, float | int]:
     if not lst:
         return {"mean": 0.0, "min": 0.0, "max": 0.0, "n": 0}
     arr = np.asarray(lst, dtype=float)
-    return {"mean": float(arr.mean()), "min": float(arr.min()), "max": float(arr.max()), "n": int(arr.size)}
+    return {"mean": float(arr.mean()), "max": float(arr.max()), "sum": float(arr.sum())}
 
 def _sma_last(buf: List[float], window: int) -> float:
     if not buf: return 0.0
@@ -294,7 +294,47 @@ def event_accumulate_second(
     starts_a: int,
     starts_b: int,
     p,  # SegParams
+    player_state_a: Optional[Dict[int, Dict[str, float]]] = None,
+    player_state_b: Optional[Dict[int, Dict[str, float]]] = None,
 ) -> None:
+
+    # ---- helper: top-K sets (compradores/vendedores) a partir do estado ----
+    def _top_sets_by_state(state: Optional[Dict[int, Dict[str, float]]], k: int = 5):
+        if not state:
+            return set(), set()
+
+        # se houver cumulativos, priorize-os; senão, use posição líquida
+        has_cum = any(("cum_buy" in v or "cum_sell" in v) for v in state.values())
+
+        if has_cum:
+            buyers = sorted(((aid, float(v.get("cum_buy", 0.0))) for aid, v in state.items()),
+                            key=lambda kv: kv[1], reverse=True)
+            sellers = sorted(((aid, float(v.get("cum_sell", 0.0))) for aid, v in state.items()),
+                             key=lambda kv: kv[1], reverse=True)
+            buyers = [aid for aid, vol in buyers if vol > 0][:k]
+            sellers = [aid for aid, vol in sellers if vol > 0][:k]
+        else:
+            # por posição líquida: >0 são compradores do dia; <0 vendedores
+            buyers = sorted(((aid, float(v.get("pos", 0.0))) for aid, v in state.items() if float(v.get("pos", 0.0)) > 0),
+                            key=lambda kv: kv[1], reverse=True)
+            sellers = sorted(((aid, -float(v.get("pos", 0.0))) for aid, v in state.items() if float(v.get("pos", 0.0)) < 0),
+                             key=lambda kv: kv[1], reverse=True)
+            buyers = [aid for aid, _ in buyers][:k]
+            sellers = [aid for aid, _ in sellers][:k]
+
+        return set(buyers), set(sellers)
+
+    # K configurável, default=5
+    TOP_K = int(getattr(p, "top_k_players", 5))
+
+    # locks/keys extras (se não existirem ainda)
+    ev_acc.setdefault("top_buy_vol_a", 0.0)
+    ev_acc.setdefault("top_sell_vol_a", 0.0)
+    ev_acc.setdefault("top_buy_vol_b", 0.0)
+    ev_acc.setdefault("top_sell_vol_b", 0.0)
+    ev_acc.setdefault("top_dir_part_a", 0.0)  # participação direcional (A)
+    ev_acc.setdefault("top_dir_part_b", 0.0)  # participação direcional (B)
+    ev_acc.setdefault("top_dir_part",   0.0)  # soma A+B
 
     # --- histogramas de preço (WDO) ---
     price_count, price_vol, sec_price = _bucket_price_stats_ab(
@@ -388,27 +428,68 @@ def event_accumulate_second(
             ev_acc["retrace_ticks"] = 0.0
             ev_acc["retrace_secs"]  = 0
 
-    # --- tops (se fornecidos) ---
-    if getattr(p, "top_buyers_a", ()) or getattr(p, "top_sellers_a", ()):
-        for tr in trades_a:
-            lot = float(tr[1]) if len(tr) > 1 else 0.0
-            ag  = int(tr[4]) if len(tr) > 4 else 0
+    # --- tops (derivados do estado do dia) ---
+    topB_a, topS_a = _top_sets_by_state(player_state_a, TOP_K)
+    topB_b, topS_b = _top_sets_by_state(player_state_b, TOP_K)
+
+    # função interna: acumula participação dado trades e conjuntos top
+    def _accumulate_top_participation(trades, topB: set, topS: set, sgn_dir: int, which: str):
+        """
+        sgn_dir: +1 para alta, -1 para baixa, 0 = neutro (ignora)
+        which: "a" ou "b"
+        Regras:
+          - sgn>0 (alta): +lote se (ag=1 e buyer ∈ topB), -lote se (ag=2 e seller ∈ topS)
+          - sgn<0 (baixa): +lote se (ag=2 e seller ∈ topS), -lote se (ag=1 e buyer ∈ topB)
+        Também mantém contadores crus top_buy_vol_* e top_sell_vol_* (independente de direção).
+        """
+        if sgn_dir == 0:
+            return 0.0
+
+        dir_acc = 0.0
+        for tr in trades:
+            lote = float(tr[1]) if len(tr) > 1 else 0.0
+            ag   = int(tr[4]) if len(tr) > 4 else 0    # 1=buy, 2=sell
             b_comp = int(tr[2]) if len(tr) > 2 else -1
             b_vend = int(tr[3]) if len(tr) > 3 else -1
-            if ag == 1 and b_comp in getattr(p, "top_buyers_a", ()):
-                ev_acc["top_buy_vol_a"] += lot
-            if ag == 2 and b_vend in getattr(p, "top_sellers_a", ()):
-                ev_acc["top_sell_vol_a"] += lot
-    if getattr(p, "top_buyers_b", ()) or getattr(p, "top_sellers_b", ()):
-        for tr in trades_b:
-            lot = float(tr[1]) if len(tr) > 1 else 0.0
-            ag  = int(tr[4]) if len(tr) > 4 else 0
-            b_comp = int(tr[2]) if len(tr) > 2 else -1
-            b_vend = int(tr[3]) if len(tr) > 3 else -1
-            if ag == 1 and b_comp in getattr(p, "top_buyers_b", ()):
-                ev_acc["top_buy_vol_b"] += lot
-            if ag == 2 and b_vend in getattr(p, "top_sellers_b", ()):
-                ev_acc["top_sell_vol_b"] += lot
+
+            # contadores crus (mantém compatibilidade com o que você já tinha)
+            if which == "a":
+                if ag == 1 and b_comp in topB: ev_acc["top_buy_vol_a"]  += lote
+                if ag == 2 and b_vend in topS: ev_acc["top_sell_vol_a"] += lote
+            else:
+                if ag == 1 and b_comp in topB: ev_acc["top_buy_vol_b"]  += lote
+                if ag == 2 and b_vend in topS: ev_acc["top_sell_vol_b"] += lote
+
+            # participação direcional (soma se alinha, subtrai se contrária)
+            if sgn_dir > 0:
+                if ag == 1 and b_comp in topB:
+                    dir_acc += lote       # buy em alta -> a favor
+                if ag == 2 and b_vend in topS:
+                    dir_acc -= lote       # sell em alta -> contra
+            else:  # sgn_dir < 0
+                if ag == 2 and b_vend in topS:
+                    dir_acc += lote       # sell em baixa -> a favor
+                if ag == 1 and b_comp in topB:
+                    dir_acc -= lote       # buy em baixa -> contra
+
+        if which == "a":
+            ev_acc["top_dir_part_a"] += dir_acc
+        else:
+            ev_acc["top_dir_part_b"] += dir_acc
+
+        return dir_acc
+
+    # acumula por símbolo e totaliza
+    part_a = _accumulate_top_participation(trades_a, topB_a, topS_a, sgn, "a")
+    part_b = _accumulate_top_participation(trades_b, topB_b, topS_b, sgn, "b")
+    ev_acc["top_dir_part"] += (part_a + part_b)
+
+    # opcional: registrar por segundo no vetor persec, junto do que você já salva
+    if ev_acc["persec"]:
+        ev_acc["persec"][-1]["top_part_a"] = part_a
+        ev_acc["persec"][-1]["top_part_b"] = part_b
+        ev_acc["persec"][-1]["top_part"]   = part_a + part_b
+
 
 # ===== 3) enriquecimento final simplificado =====
 def finalize_event_enrichment(
@@ -489,29 +570,6 @@ def finalize_event_enrichment(
     opp_vol = (sell_a + sell_b) if dir_sign > 0 else ((buy_a + buy_b) if dir_sign < 0 else 0.0)
     ease_of_move = (net_ticks / max(1.0, opp_vol)) if dir_sign != 0 else 0.0
 
-    ev["move_info"] = {
-        "range_ticks": ticks_delta(p_low, p_high, tick_a),
-        "d_ticks_max": float(acc["max_group_ticks"]),
-        "vol_per_tick_up_a":  _stats_list(up_a),
-        "vol_per_tick_dn_a":  _stats_list(dn_a),
-        "vol_per_tick_up_b":  _stats_list(up_b),
-        "vol_per_tick_dn_b":  _stats_list(dn_b),
-        "buy_share_wdo":  float(buy_share_a),
-        "sell_share_wdo": float(sell_share_a),
-        "absorptions_buy":  abs_buy,
-        "absorptions_sell": abs_sell,
-        "ease_of_move": float(ease_of_move),
-    }
-
-    # 5) Players (tops do dia)
-    ev["players_info"] = {
-        "top_buy_vol_wdo": float(acc["top_buy_vol_a"]),
-        "top_sell_vol_wdo": float(acc["top_sell_vol_a"]),
-        "top_buy_vol_dol": float(acc["top_buy_vol_b"]),
-        "top_sell_vol_dol": float(acc["top_sell_vol_b"]),
-        # numero de players diferente
-    }
-
     # SMA 15m do preço do WDO usando buffer de 30m do metrics (1Hz). Janela = 900s.
     d5m = p_close - metrics.mean_price_5m
     d30 = p_close - metrics.mean_price_30m
@@ -534,7 +592,8 @@ def finalize_event_enrichment(
         "ddayo": ddayo,
         "d5m": d5m,
         "d30m": d30,
-        "efrang": abs(p_close-p_open) / min(0.1, rng), #eficiencia de range
+        "rng": rng,
+        "efrang": abs(p_close-p_open) / max(0.1, rng), #eficiencia de range
         "pctx0": ctx_feats[0],
         "pctx1": ctx_feats[1],
         "pctx2": ctx_feats[2],
@@ -553,7 +612,20 @@ def finalize_event_enrichment(
         "max_streak_sell": int(acc["max_streak_sell"]),
         "ema_vol_total": float(getattr(metrics, "ema_vol_total", 0.0) or 0.0),
         "ema_order_rate": float(getattr(metrics, "ema_order_rate", 0.0) or 0.0),
-
+        "d_ticks_max": float(acc["max_group_ticks"]),
+        "vol_per_tick_up_a":  _stats_list(up_a),
+        "vol_per_tick_dn_a":  _stats_list(dn_a),
+        "vol_per_tick_up_b":  _stats_list(up_b),
+        "vol_per_tick_dn_b":  _stats_list(dn_b),
+        "buy_share_wdo":  float(buy_share_a),
+        "sell_share_wdo": float(sell_share_a),
+        "absorptions_buy":  abs_buy,
+        "absorptions_sell": abs_sell,
+        "ease_of_move": float(ease_of_move),
+        "top_buy_vol_wdo": float(acc["top_buy_vol_a"]),
+        "top_sell_vol_wdo": float(acc["top_sell_vol_a"]),
+        "top_buy_vol_dol": float(acc["top_buy_vol_b"]),
+        "top_sell_vol_dol": float(acc["top_sell_vol_b"]),
     }
 
     return ev
@@ -1467,6 +1539,8 @@ class EventSegmenter:
             self.p.tick_a, self.p.tick_b,
             smry_a["n"], smry_b["n"],
             self.p,
+            player_state_a=self.player_state_a,
+            player_state_b=self.player_state_b,
         )
 
         # --- DETECTORES ---

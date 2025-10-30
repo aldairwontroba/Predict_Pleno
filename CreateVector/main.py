@@ -141,10 +141,11 @@ def process_all():
     pass
 
 if __name__ == "__main__":
-    realtime = True
+    realtime = False
 
     DATA_DIR  = Path(r"E:\Mercado BMF&BOVESPA\tryd\consolidados_npz")
-    DAY       = "20210804"
+    DATA_DIR  = Path("./")
+    DAY       = "20250912"
     PAIR      = ("wdo", "dol")   # ou 
     # PAIR      = ("win", "ind")   # ou 
 
@@ -152,7 +153,7 @@ if __name__ == "__main__":
         realtime_process(PAIR)
 
     else:
-        eventos, sec_a, sec_b = process_day(DATA_DIR, DAY, PAIR, imprimir=False)
+        eventos, sec_a, sec_b = process_day(DATA_DIR, DAY, PAIR, imprimir=True)
 
         print_event_stats(eventos)
 
