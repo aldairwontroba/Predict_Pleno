@@ -1,213 +1,269 @@
-"""
-Core classes and functions for segmenting trade data into events.
-
-This module encapsulates the event segmentation logic originally found
-in `create_vector_to_vqvae.py`. The goal is to provide a clean API
-for processing streams of trade data and generating enriched event
-records. The code has been broken down into smaller functions and
-documented for clarity. It depends on the helper functions defined in
-``refactored.utils`` for summarising trades, grouping orders and
-extracting price features.
-
-Users should instantiate :class:`EventSegmenter` with a
-``SegParams`` instance. Then call :meth:`step` with the timestamp and
-trades for each second. The returned list of events contains all
-events that ended during that call. At the end of a trading day the
-last event (if any) should be closed manually by setting its
-``end_reason`` and appending it to the output.
-"""
-
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Iterable
-from collections import defaultdict, Counter
+from collections import defaultdict, deque
 import math
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from datetime import datetime, timezone
+import matplotlib.dates as mdates
+from zoneinfo import ZoneInfo
 
-import utils
+LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
 
-__all__ = [
-    "SegParams",
-    "RefMetrics",
-    "EventSegmenter",
-    "event_accumulate_second",
-    "finalize_event_enrichment",
-]
+# ===== helpers mínimos (sem utils) =====
+def summarize_second(trades: List[List[float]]) -> Dict[str, Optional[float]]:
+    """Summarize a list of trades for a single second.
 
+    The trades list is expected to contain rows where the first element is
+    price and the second element (if present) is the lot size. Additional
+    columns are ignored for the purpose of summarisation.
 
-@dataclass
-class SegParams:
-    """Hyperparameters controlling event segmentation.
+    Returns a dictionary with the following keys:
 
-    These parameters tune the behaviour of the event detection
-    algorithm. They correspond closely to the variables in the original
-    implementation but have been grouped into a dataclass for
-    readability and ease of configuration. See the original code for
-    descriptions of each field.
+    ``n``: number of trades
+    ``vol``: total volume (sum of lots)
+    ``lot_max``: maximum lot in this second
+    ``open``: opening price (first trade)
+    ``close``: closing price (last trade)
+    ``pmin``: minimum price
+    ``pmax``: maximum price
+
+    If there are no trades the returned values are set to safe defaults.
     """
-    # tick sizes and lot multipliers for symbols A and B
-    tick_a: float = 0.5
-    tick_b: float = 0.5
-    lot_mult_a: float = 1.0
-    lot_mult_b: float = 5.0
-
-    # EMAs for volume, range and order rate (time constants in minutes)
-    tau_vol_min: float = 5.0
-    tau_var_min: float = 2.0
-    var_win_sec: int = 120
-    tau_order_min: float = 5.0
-
-    # Cooldown time between event boundaries
-    boundary_cooldown_s: int = 0
-
-    # Volume and player thresholds
-    start_vol_mult: float = 5.0
-    vol_1s_hard: float = 2000.0
-    player_mult: float = 5.0
-
-    # Range decay thresholds
-    range_start_mult: float = 1.0
-    range_end_mult: float = 0.4
-    half_life_frac: float = 1.0 / 3.0
-
-    # Maximum event duration (seconds)
-    max_dur_s: int = 60
-
-    # Renko settings
-    renko_nticks: int = 2
-    renko_symbol: str = "a"
-
-    # Order rate thresholds
-    tau_order_rate_min: float = 8.0
-    order_rate_mult: float = 1.5
-    order_rate_consec_sec: int = 2
-
-    # Speed thresholds
-    speed_price_mult: float = 20.0
-    speed_price_consec_sec: int = 3
-    min_event_sec_speed: int = 3
-
-    # Player vs volume threshold
-    player_mult_vs_vol_ema: float = 5.0
-
-    # Range thresholds with decay during the event
-    range_mult_start: float = 1.5
-    range_mult_end: float = 0.8
-    decay_half_life_frac: float = 1.0 / 3.0
-
-    # Absorption detection thresholds
-    absorb_ticks_thr: int = 2
-    absorb_max_wait_s: int = 10
-
-    # Which symbol to use as the price reference ("a" for WDO/WIN or "b" for DOL/IND)
-    price_ref_symbol: str = "a"
-
-    # Top players of the day (optional)
-    top_buyers_a: Tuple[int, ...] = ()
-    top_sellers_a: Tuple[int, ...] = ()
-    top_buyers_b: Tuple[int, ...] = ()
-    top_sellers_b: Tuple[int, ...] = ()
-
-
-def exp_decay_mult(t: int, start_mult: float, end_mult: float, half_life_sec: float) -> float:
-    """Exponential decay multiplier.
-
-    Returns a value that decays from ``start_mult`` to ``end_mult`` with a
-    half‑life of ``half_life_sec`` seconds. When ``t`` is zero the
-    ``start_mult`` is returned; for large ``t`` the value asymptotically
-    approaches ``end_mult``.
-    """
-    if t <= 0:
-        return start_mult
-    k = 0.5 ** (t / max(half_life_sec, 1e-9))
-    return end_mult + (start_mult - end_mult) * k
-
-
-def renko_reversal_this_second(
-    anchor: Optional[float],
-    direction: int,
-    pmin: Optional[float],
-    pmax: Optional[float],
-    brick: float,
-) -> Tuple[bool, Optional[float], int]:
-    """Detect a Renko reversal within a second.
-
-    Given the current Renko anchor (last close), direction and the
-    second's high/low, determine whether a reversal has occurred.
-    Returns a tuple ``(reversal_bool, new_anchor, new_dir)``. If no
-    reversal is detected the anchor and direction are updated to absorb
-    any full bricks moved in the same direction.
-    """
-    if anchor is None or pmin is None or pmax is None:
-        return False, anchor, direction
-
-    rev = False
-    # Check for reversal: move two bricks in the opposite direction
-    if direction >= 0:
-        # fall: two bricks down from anchor
-        if pmin <= anchor - 2 * brick:
-            rev = True
-            anchor = anchor - brick
-            direction = -1
-    if direction <= 0 and not rev:
-        # rise: two bricks up from anchor
-        if pmax >= anchor + 2 * brick:
-            rev = True
-            anchor = anchor + brick
-            direction = 1
-
-    # Absorb extra bricks in the same direction
-    if direction == 1 and pmax is not None:
-        n_up = int((pmax - anchor) // brick)
-        if n_up > 0:
-            anchor += n_up * brick
-    if direction == -1 and pmin is not None:
-        n_dn = int((anchor - pmin) // brick)
-        if n_dn > 0:
-            anchor -= n_dn * brick
-
-    return rev, anchor, direction
-
-
-def event_acc_init() -> Dict[str, object]:
-    """Initialise an accumulator for per‑event statistics.
-
-    Returns a dictionary with keys corresponding to various metrics that
-    accumulate over the life of an event. This dictionary is attached to
-    the event under the ``"acc"`` key and is updated by
-    :func:`event_accumulate_second`.
-    """
+    if not trades:
+        return {
+            "n": 0,
+            "vol": 0.0,
+            "lot_max": 0.0,
+            "open": None,
+            "close": None,
+            "pmin": None,
+            "pmax": None,
+        }
+    prices = [float(tr[0]) for tr in trades]
+    lots = [float(tr[1]) if len(tr) > 1 else 1.0 for tr in trades]
     return {
-        # price stats (WDO)
+        "n": len(trades),
+        "vol": float(sum(lots)),
+        "lot_max": float(max(lots)),
+        "open": prices[0],
+        "close": prices[-1],
+        "pmin": min(prices),
+        "pmax": max(prices),
+    }
+
+def extrair_preco(x: np.ndarray) -> np.ndarray:
+    """Extract periodic price features used for context information.
+
+    For each price in ``x`` this function computes a vector of five features
+    corresponding to different periodic transforms of the price modulo 10 and
+    100. These features were introduced in the original script to capture
+    meaningful price patterns relative to common tick thresholds.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Array of price values.
+
+    Returns
+    -------
+    np.ndarray
+        A two‑dimensional array where each row corresponds to the five
+        features for the associated input price.
+    """
+    def suave_5_0(x_val: np.ndarray) -> np.ndarray:
+        resto = x_val % 10
+        return np.cos(np.pi * resto / 5)
+
+    def quebra_no_bola(x_val: np.ndarray) -> np.ndarray:
+        frac = x_val % 10
+        return -np.cos(np.pi * frac / 10)
+
+    def cosseno_localizado(x_val: np.ndarray, centro: float, largura: float = 15.0) -> np.ndarray:
+        x_mod = x_val % 100
+        dist = np.abs(x_mod - centro)
+        y = np.full_like(x_mod, -1.0, dtype=float)
+        dentro = dist <= largura
+        y[dentro] = np.cos(np.pi * (x_mod[dentro] - centro) / largura)
+        return y
+
+    def funcao_357(x_val: np.ndarray) -> np.ndarray:
+        picos = [0, 30, 50, 70, 100]
+        largura = 15.0
+        x_arr = np.asarray(x_val, dtype=float)
+        y = np.full_like(x_arr, -1.0, dtype=float)
+        for c in picos:
+            y = np.maximum(y, cosseno_localizado(x_arr, c, largura))
+        return y
+
+    # Vectorised computations on numpy arrays
+    s10 = suave_5_0(x)
+    s100 = suave_5_0(x / 10)
+    o10 = quebra_no_bola(x)
+    o100 = quebra_no_bola(x / 10)
+    f100 = funcao_357(x)
+
+    return np.stack([s10, s100, o10, o100, f100], axis=-1)
+
+def ticks_delta(p0: Optional[float], p1: Optional[float], tick: float) -> float:
+    if p0 is None or p1 is None or not tick or tick <= 0:
+        return 0.0
+    return (float(p1) - float(p0)) / float(tick)
+
+def _bucket_price_stats_ab(
+    trades_a: List[List[float]],
+    trades_b: List[List[float]],
+    close_a: Optional[float],
+    close_b: Optional[float],
+    tick_a: float,
+    tick_b: float,
+):
+    """
+    Buckets de preço por segundo:
+      - Se houver trades em A (WDO), bucketiza por preço de A (tick_a).
+      - Caso contrário, bucketiza por preço de B (tick_b).
+    Volume:
+      - Soma o volume do símbolo de referência normalmente por preço.
+      - Soma o volume do OUTRO símbolo no bucket do 'preço de fechamento' do símbolo de referência
+        (não temos mapeamento de preço cruzado, então alocamos no close do ref).
+    Retorna: price_count (dict), price_vol (dict), sec_price (float ou None)
+    """
+    def bucket(px: float, tk: float) -> float:
+        return (round(px / tk) * tk) if (tk and tk > 0) else float(px)
+
+    use_a = len(trades_a) > 0  # A é referência se tiver trade neste segundo
+    if use_a:
+        ref_trades, oth_trades = trades_a, trades_b
+        tk_ref, tk_oth = tick_a, tick_b
+        sec_price = bucket(float(close_a), tk_ref) if close_a is not None else (
+            bucket(float(trades_a[-1][0]), tk_ref) if trades_a else None
+        )
+    else:
+        ref_trades, oth_trades = trades_b, trades_a
+        tk_ref, tk_oth = tick_b, tick_a
+        sec_price = bucket(float(close_b), tk_ref) if close_b is not None else (
+            bucket(float(trades_b[-1][0]), tk_ref) if trades_b else None
+        )
+
+    price_count: Dict[float, int] = defaultdict(int)
+    price_vol:   Dict[float, float] = defaultdict(float)
+
+    # Volume e contagem do símbolo de referência, por preço
+    for tr in ref_trades:
+        if not tr: 
+            continue
+        px  = float(tr[0])
+        lot = float(tr[1]) if len(tr) > 1 else 0.0
+        k = bucket(px, tk_ref)
+        price_count[k] += 1
+        price_vol[k]   += lot
+
+    # Volume do outro símbolo: aloca no bucket do preço de FECHAMENTO do ref
+    if sec_price is not None and oth_trades:
+        vol_oth = 0.0
+        for tr in oth_trades:
+            if not tr: 
+                continue
+            vol_oth += float(tr[1]) if len(tr) > 1 else 0.0
+        price_vol[sec_price] += vol_oth
+
+    return price_count, price_vol, sec_price
+
+def _vol_by_aggr(trades: Iterable[Iterable[float]]) -> Tuple[float,float,float]:
+    buy = sell = tot = 0.0
+    for tr in trades:
+        if not tr: continue
+        lot = float(tr[1]) if len(tr) > 1 else 0.0
+        ag  = int(tr[4]) if len(tr) > 4 else 0
+        tot += lot
+        if ag == 1:   buy  += lot
+        elif ag == 2: sell += lot
+    return buy, sell, tot
+
+def _group_stats_one_symbol_local(trades: List[List[float]], tick: float) -> Tuple[float,float,int,int,int]:
+    """
+    'Grupo' = (aggressor, broker_agressor) dentro do segundo.
+    Retorna:
+      max_lot, max_ticks (entre grupos), g_buy, g_sell, g_neu
+    """
+    if not trades:
+        return 0.0, 0.0, 0, 0, 0
+    groups: Dict[Tuple[int,int], Dict[str, float]] = {}
+    for tr in trades:
+        px  = float(tr[0]) if len(tr) > 0 else 0.0
+        lot = float(tr[1]) if len(tr) > 1 else 0.0
+        b_comp = int(tr[2]) if len(tr) > 2 else -1
+        b_vend = int(tr[3]) if len(tr) > 3 else -1
+        ag  = int(tr[4]) if len(tr) > 4 else 0
+        if ag == 1:
+            key = (1, b_comp)
+        elif ag == 2:
+            key = (-1, b_vend)
+        else:
+            key = (0, -1)
+        g = groups.get(key)
+        if g is None:
+            groups[key] = {"lot": lot, "p_open": px, "p_close": px}
+        else:
+            g["lot"] += lot
+            g["p_close"] = px
+
+    max_lot = 0.0
+    max_ticks = 0.0
+    g_buy = g_sell = g_neu = 0
+    for (side, _), g in groups.items():
+        max_lot = max(max_lot, float(g["lot"]))
+        dtk = abs(ticks_delta(g["p_open"], g["p_close"], tick))
+        max_ticks = max(max_ticks, dtk)
+        if side > 0:   g_buy  += 1
+        elif side < 0: g_sell += 1
+        else:          g_neu  += 1
+    return max_lot, max_ticks, g_buy, g_sell, g_neu
+
+def _stats_list(lst: List[float]) -> Dict[str, float | int]:
+    if not lst:
+        return {"mean": 0.0, "min": 0.0, "max": 0.0, "n": 0}
+    arr = np.asarray(lst, dtype=float)
+    return {"mean": float(arr.mean()), "min": float(arr.min()), "max": float(arr.max()), "n": int(arr.size)}
+
+def _sma_last(buf: List[float], window: int) -> float:
+    if not buf: return 0.0
+    if window <= 0 or len(buf) <= window:
+        return float(np.mean(buf))
+    return float(np.mean(buf[-window:]))
+
+# ===== 1) acumulador simplificado =====
+def event_acc_init() -> Dict[str, object]:
+    return {
+        # Histograma de preço (WDO)
         "price_count": defaultdict(int),
         "price_vol": defaultdict(float),
         "secs_at_price": defaultdict(int),
-        # group stats
+
+        # Volume por lado e total
+        "buy_vol_a": 0.0, "sell_vol_a": 0.0, "tot_vol_a": 0.0,
+        "buy_vol_b": 0.0, "sell_vol_b": 0.0, "tot_vol_b": 0.0,
+
+        # Estatísticas de grupos (por segundo)
         "max_group_lot": 0.0,
         "max_group_ticks": 0.0,
-        # volume stats
-        "buy_vol_a": 0.0,
-        "sell_vol_a": 0.0,
-        "tot_vol_a": 0.0,
-        "buy_vol_b": 0.0,
-        "sell_vol_b": 0.0,
-        "tot_vol_b": 0.0,
-        # group counts
-        "g_buy": 0,
-        "g_sell": 0,
-        "g_neu": 0,
-        # order rate
-        "orders_started_sum": 0.0,
-        "rate_max": 0.0,
-        # streaks
+        "g_buy": 0, "g_sell": 0, "g_neu": 0,
+
+        # Taxa de ordens
+        "orders_started_sum": 0.0,   # soma por segundo
+        "rate_max": 0.0,             # máximo por segundo
+
+        # Streaks (predominância por segundo)
         "streak_buy": 0,
         "streak_sell": 0,
         "max_streak_buy": 0,
         "max_streak_sell": 0,
-        # per second movement
-        "persec": [],
-        # absorption tracking (based on reference symbol)
+
+        # Série por segundo (movimento e volumes)
+        "persec": [],  # cada item: {dtk_a, dtk_b, buy_a, sell_a, buy_b, sell_b}
+
+        # Absorção (pernas e retrações) — ref WDO
         "run_sign": 0,
         "run_ticks": 0.0,
         "run_secs": 0,
@@ -216,87 +272,13 @@ def event_acc_init() -> Dict[str, object]:
         "retrace_secs": 0,
         "absorb_buy": [],
         "absorb_sell": [],
-        # top player volumes
-        "top_buy_vol_a": 0.0,
-        "top_sell_vol_a": 0.0,
-        "top_buy_vol_b": 0.0,
-        "top_sell_vol_b": 0.0,
+
+        # Players (tops do dia)
+        "top_buy_vol_a": 0.0, "top_sell_vol_a": 0.0,
+        "top_buy_vol_b": 0.0, "top_sell_vol_b": 0.0,
     }
 
-
-@dataclass
-class RefMetrics:
-    """Exponential moving averages used as global baselines.
-
-    This object tracks EMAs of volume, range and order rate. It also
-    keeps rolling buffers of closing prices used to estimate five‑minute
-    range baselines. Each call to :meth:`update` updates the EMAs and
-    pushes prices into the buffers. Rolling buffers are trimmed to
-    maintain a maximum length.
-    """
-
-    alpha_vol: float
-    alpha_var: float
-    alpha_rate: float
-    ema_vol_sec: float = 1.0
-    ema_var5m: float = 1.0
-    ema_order_rate: float = 1.0
-    buf_a: List[float] = field(default_factory=list)
-    buf_b: List[float] = field(default_factory=list)
-
-    @classmethod
-    def create(cls, tau_vol_min: float, tau_var_min: float, tau_order_min: float) -> "RefMetrics":
-        # Convert time constants in minutes to per‑second alphas
-        a_vol = 1.0 - math.exp(-1.0 / max(1.0, tau_vol_min * 60.0))
-        a_var = 1.0 - math.exp(-1.0 / max(1.0, tau_var_min * 60.0))
-        a_rate = 1.0 - math.exp(-1.0 / max(1.0, tau_order_min * 60.0))
-        return cls(a_vol, a_var, a_rate)
-
-    def update(self,
-               close_a: Optional[float],
-               close_b: Optional[float],
-               vol_comb: float,
-               orders_started_this_sec: float) -> None:
-        """Update moving averages and rolling buffers for this second."""
-        # Volume EMA
-        self.ema_vol_sec = (1.0 - self.alpha_vol) * self.ema_vol_sec + self.alpha_vol * float(vol_comb)
-        # Append closing prices for range estimation (approx 5 minutes at 1 Hz)
-        if close_a is not None:
-            self.buf_a.append(float(close_a))
-            self.buf_a = self.buf_a[-300:]
-        if close_b is not None:
-            self.buf_b.append(float(close_b))
-            self.buf_b = self.buf_b[-300:]
-        # 5‑minute range baseline (max difference between buffered prices)
-        var5_a = (max(self.buf_a) - min(self.buf_a)) if len(self.buf_a) >= 2 else 0.0
-        var5_b = (max(self.buf_b) - min(self.buf_b)) if len(self.buf_b) >= 2 else 0.0
-        self.ema_var5m = (1.0 - self.alpha_var) * self.ema_var5m + self.alpha_var * max(var5_a, var5_b)
-        # Order rate EMA
-        self.ema_order_rate = (1.0 - self.alpha_rate) * self.ema_order_rate + self.alpha_rate * float(orders_started_this_sec)
-
-
-def _safe_mean(seq: Iterable[float], fallback: Optional[float] = None) -> float:
-    """Compute the mean of a sequence, filtering out non‑finite values.
-    If no valid values are present, returns ``fallback`` if it is finite
-    or ``0.0`` otherwise."""
-    vals = []
-    for v in seq or []:
-        try:
-            f = float(v)
-        except Exception:
-            continue
-        if math.isfinite(f):
-            vals.append(f)
-    if vals:
-        return float(sum(vals) / len(vals))
-    fb = None
-    try:
-        fb = float(fallback)
-    except Exception:
-        fb = None
-    return float(fb) if (fb is not None and math.isfinite(fb)) else 0.0
-
-
+# ===== 2) acumular um segundo no evento (sem utils.*) =====
 def event_accumulate_second(
     ev_acc: Dict[str, object],
     trades_a: List[List[float]],
@@ -311,330 +293,889 @@ def event_accumulate_second(
     tick_b: float,
     starts_a: int,
     starts_b: int,
-    p: SegParams,
+    p,  # SegParams
 ) -> None:
-    """Accumulate detailed statistics for the current second into ``ev_acc``.
 
-    This function updates the provided accumulator dictionary with
-    per‑second metrics such as price histograms, volume breakdown,
-    group counts, streaks, per‑second movement and absorption statistics.
-    It is called once per second while an event is active. See the
-    original code for detailed explanations of each metric.
-    """
-    # Price histograms (WDO only)
-    price_count, price_vol, sec_price = utils._bucket_price_stats_wdo(trades_a, close_a)
-    for k, v in price_count.items():
+    # --- histogramas de preço (WDO) ---
+    price_count, price_vol, sec_price = _bucket_price_stats_ab(
+        trades_a, trades_b, close_a, close_b, tick_a, tick_b
+    )
+    for k,v in price_count.items():
         ev_acc["price_count"][k] += v
-    for k, v in price_vol.items():
+    for k,v in price_vol.items():
         ev_acc["price_vol"][k] += v
     if sec_price is not None:
         ev_acc["secs_at_price"][sec_price] += 1
-    # Volume by aggressor
-    buy_a, sell_a, tot_a = utils._vol_by_aggr(trades_a)
-    buy_b, sell_b, tot_b = utils._vol_by_aggr(trades_b)
-    ev_acc["buy_vol_a"] += buy_a
-    ev_acc["sell_vol_a"] += sell_a
-    ev_acc["tot_vol_a"] += tot_a
-    ev_acc["buy_vol_b"] += buy_b
-    ev_acc["sell_vol_b"] += sell_b
-    ev_acc["tot_vol_b"] += tot_b
-    # Group stats per symbol
-    mlot_a, mtick_a, g_buy_a, g_sell_a, g_neu_a = utils._group_stats_one_symbol(trades_a, tick_a)
-    mlot_b, mtick_b, g_buy_b, g_sell_b, g_neu_b = utils._group_stats_one_symbol(trades_b, tick_b)
-    ev_acc["max_group_lot"] = max(ev_acc["max_group_lot"], mlot_a, mlot_b)
+
+    # --- volumes por agressor ---
+    buy_a, sell_a, tot_a = _vol_by_aggr(trades_a)
+    buy_b, sell_b, tot_b = _vol_by_aggr(trades_b)
+    ev_acc["buy_vol_a"] += buy_a; ev_acc["sell_vol_a"] += sell_a; ev_acc["tot_vol_a"] += tot_a
+    ev_acc["buy_vol_b"] += buy_b; ev_acc["sell_vol_b"] += sell_b; ev_acc["tot_vol_b"] += tot_b
+
+    # --- grupos por símbolo (lado+broker agressor) ---
+    mlot_a, mtick_a, g_buy_a, g_sell_a, g_neu_a = _group_stats_one_symbol_local(trades_a, tick_a)
+    mlot_b, mtick_b, g_buy_b, g_sell_b, g_neu_b = _group_stats_one_symbol_local(trades_b, tick_b)
+    ev_acc["max_group_lot"]   = max(ev_acc["max_group_lot"], mlot_a, mlot_b)
     ev_acc["max_group_ticks"] = max(ev_acc["max_group_ticks"], mtick_a, mtick_b)
-    ev_acc["g_buy"] += (g_buy_a + g_buy_b)
+    ev_acc["g_buy"]  += (g_buy_a  + g_buy_b)
     ev_acc["g_sell"] += (g_sell_a + g_sell_b)
-    ev_acc["g_neu"] += (g_neu_a + g_neu_b)
-    # Order rate
+    ev_acc["g_neu"]  += (g_neu_a  + g_neu_b)
+
+    # --- taxa de ordens (por segundo) ---
     rate_now = float(starts_a + starts_b)
     ev_acc["orders_started_sum"] += rate_now
     ev_acc["rate_max"] = max(ev_acc["rate_max"], rate_now)
-    # Streaks per second (dominant side by group counts)
+
+    # --- streaks por segundo (lado dominante por #grupos) ---
     if (g_buy_a + g_buy_b) > (g_sell_a + g_sell_b):
-        ev_acc["streak_buy"] += 1
-        ev_acc["streak_sell"] = 0
+        ev_acc["streak_buy"]  += 1
+        ev_acc["streak_sell"]  = 0
     elif (g_sell_a + g_sell_b) > (g_buy_a + g_buy_b):
         ev_acc["streak_sell"] += 1
-        ev_acc["streak_buy"] = 0
+        ev_acc["streak_buy"]   = 0
     else:
         ev_acc["streak_buy"] = 0
         ev_acc["streak_sell"] = 0
-    ev_acc["max_streak_buy"] = max(ev_acc["max_streak_buy"], ev_acc["streak_buy"])
+    ev_acc["max_streak_buy"]  = max(ev_acc["max_streak_buy"],  ev_acc["streak_buy"])
     ev_acc["max_streak_sell"] = max(ev_acc["max_streak_sell"], ev_acc["streak_sell"])
-    # Per‑second movement (reference symbol)
-    use_a = (p.price_ref_symbol.lower() == "a")
-    dtk_a = utils.ticks_delta(last_close_a, close_a, tick_a)
-    dtk_b = utils.ticks_delta(last_close_b, close_b, tick_b)
-    dtk_ref = dtk_a if use_a else dtk_b
-    # Directional volumes for reference symbol
-    dir_buy_vol = buy_a + buy_b
-    dir_sell_vol = sell_a + sell_b
+
+    # --- movimento por segundo (dtk) + registro de volumes no segundo ---
+    dtk_a = ticks_delta(last_close_a, close_a, tick_a)
+    dtk_b = ticks_delta(last_close_b, close_b, tick_b)
     ev_acc["persec"].append({
-        "dtk_a": dtk_a,
-        "dtk_b": dtk_b,
-        "buy_a": buy_a,
-        "sell_a": sell_a,
-        "buy_b": buy_b,
-        "sell_b": sell_b,
-        "dtk_ref": dtk_ref,
+        "dtk_a": dtk_a, "dtk_b": dtk_b,
+        "buy_a": buy_a, "sell_a": sell_a,
+        "buy_b": buy_b, "sell_b": sell_b,
     })
-    # Absorption detection based on reference symbol
+
+    # --- absorção (ref = símbolo A/WDO) ---
+    use_a = (str(getattr(p, "price_ref_symbol", "a")).lower() == "a")
+    dtk_ref = dtk_a if use_a else dtk_b
+    dir_buy_vol  = (buy_a + buy_b)
+    dir_sell_vol = (sell_a + sell_b)
+
     sgn = 1 if dtk_ref > 0 else (-1 if dtk_ref < 0 else 0)
     if sgn == 0:
-        pass  # no change
+        pass
     elif ev_acc["run_sign"] == 0:
-        # Start new leg
         ev_acc["run_sign"] = sgn
         ev_acc["run_ticks"] = abs(dtk_ref)
-        ev_acc["run_secs"] = 1
+        ev_acc["run_secs"]  = 1
         ev_acc["retrace_ticks"] = 0.0
-        ev_acc["retrace_secs"] = 0
-        ev_acc["run_dir_vol"] = dir_buy_vol if sgn > 0 else dir_sell_vol
+        ev_acc["retrace_secs"]  = 0
+        ev_acc["run_dir_vol"]   = (dir_buy_vol if sgn > 0 else dir_sell_vol)
     elif sgn == ev_acc["run_sign"]:
-        # Continue current leg
         ev_acc["run_ticks"] += abs(dtk_ref)
-        ev_acc["run_secs"] += 1
-        ev_acc["run_dir_vol"] += dir_buy_vol if sgn > 0 else dir_sell_vol
-        # Reset retrace
+        ev_acc["run_secs"]  += 1
+        ev_acc["run_dir_vol"] += (dir_buy_vol if sgn > 0 else dir_sell_vol)
         ev_acc["retrace_ticks"] = 0.0
-        ev_acc["retrace_secs"] = 0
+        ev_acc["retrace_secs"]  = 0
     else:
-        # Retrace in opposite direction
         ev_acc["retrace_ticks"] += abs(dtk_ref)
-        ev_acc["retrace_secs"] += 1
-        if ev_acc["retrace_ticks"] >= p.absorb_ticks_thr and ev_acc["run_ticks"] >= p.absorb_ticks_thr:
+        ev_acc["retrace_secs"]  += 1
+        if ev_acc["retrace_ticks"] >= getattr(p, "absorb_ticks_thr", 2) and ev_acc["run_ticks"] >= getattr(p, "absorb_ticks_thr", 2):
             rec = {"ticks": ev_acc["retrace_ticks"], "secs": ev_acc["retrace_secs"]}
             if ev_acc["run_sign"] > 0:
                 ev_acc["absorb_sell"].append(rec)
             else:
                 ev_acc["absorb_buy"].append(rec)
-            # Reset and start new leg
-            ev_acc["run_sign"] = sgn
+            # start nova perna
+            ev_acc["run_sign"]  = sgn
             ev_acc["run_ticks"] = abs(dtk_ref)
-            ev_acc["run_secs"] = 1
-            ev_acc["run_dir_vol"] = dir_buy_vol if sgn > 0 else dir_sell_vol
+            ev_acc["run_secs"]  = 1
+            ev_acc["run_dir_vol"] = (dir_buy_vol if sgn > 0 else dir_sell_vol)
             ev_acc["retrace_ticks"] = 0.0
-            ev_acc["retrace_secs"] = 0
-    # Top player volumes (if provided in parameters)
-    if p.top_buyers_a or p.top_sellers_a:
+            ev_acc["retrace_secs"]  = 0
+
+    # --- tops (se fornecidos) ---
+    if getattr(p, "top_buyers_a", ()) or getattr(p, "top_sellers_a", ()):
         for tr in trades_a:
-            lot = float(tr[1]) if len(tr) > 1 else 1.0
-            ag = int(tr[4]) if len(tr) > 4 else 0
+            lot = float(tr[1]) if len(tr) > 1 else 0.0
+            ag  = int(tr[4]) if len(tr) > 4 else 0
             b_comp = int(tr[2]) if len(tr) > 2 else -1
             b_vend = int(tr[3]) if len(tr) > 3 else -1
-            if ag > 0 and b_comp in p.top_buyers_a:
+            if ag == 1 and b_comp in getattr(p, "top_buyers_a", ()):
                 ev_acc["top_buy_vol_a"] += lot
-            if ag < 0 and b_vend in p.top_sellers_a:
+            if ag == 2 and b_vend in getattr(p, "top_sellers_a", ()):
                 ev_acc["top_sell_vol_a"] += lot
-    if p.top_buyers_b or p.top_sellers_b:
+    if getattr(p, "top_buyers_b", ()) or getattr(p, "top_sellers_b", ()):
         for tr in trades_b:
-            lot = float(tr[1]) if len(tr) > 1 else 1.0
-            ag = int(tr[4]) if len(tr) > 4 else 0
+            lot = float(tr[1]) if len(tr) > 1 else 0.0
+            ag  = int(tr[4]) if len(tr) > 4 else 0
             b_comp = int(tr[2]) if len(tr) > 2 else -1
             b_vend = int(tr[3]) if len(tr) > 3 else -1
-            if ag > 0 and b_comp in p.top_buyers_b:
+            if ag == 1 and b_comp in getattr(p, "top_buyers_b", ()):
                 ev_acc["top_buy_vol_b"] += lot
-            if ag < 0 and b_vend in p.top_sellers_b:
+            if ag == 2 and b_vend in getattr(p, "top_sellers_b", ()):
                 ev_acc["top_sell_vol_b"] += lot
 
-
+# ===== 3) enriquecimento final simplificado =====
 def finalize_event_enrichment(
     ev: Dict[str, object],
-    p: SegParams,
-    metrics: RefMetrics,
+    p,                # SegParams
+    metrics,          # RefMetrics (usa ema_vol_sec, ema_order_rate, buf_30m)
     tick_a: float,
     tick_b: float,
-    extrair_preco_fn = utils.extrair_preco,
+    extrair_preco_fn = lambda arr: np.zeros((1,5), dtype=float),
 ) -> Dict[str, object]:
-    """Enrich a completed event with derived metrics.
 
-    This function takes an event dictionary and its accumulator
-    (attached under ``"acc"``), computes summary statistics and
-    context information, then stores them under separate keys. After
-    enrichment the accumulator is removed from the event.
-
-    Returns the enriched event.
-    """
     acc = ev.pop("acc", None)
     if not acc:
         return ev
-    # Helper to find the key with the maximum value in a dict
-    def _argmax_in_dict(dct: Dict[float, float]) -> Tuple[Optional[float], float]:
-        if not dct:
-            return None, 0.0
-        k = max(dct.items(), key=lambda kv: kv[1])[0]
-        return k, dct[k]
-    price_most_traded, _ = _argmax_in_dict(acc["price_count"])
-    price_most_volume, _ = _argmax_in_dict(acc["price_vol"])
-    price_most_time, _ = _argmax_in_dict(acc["secs_at_price"])
-    ev["price_info"] = {
-        "open": ev.get("p0_a"),
-        "close": ev.get("plast_a"),
-        "high": ev.get("pmax_a"),
-        "low": ev.get("pmin_a"),
-        "price_most_traded": price_most_traded,
-        "price_most_volume": price_most_volume,
-        "price_most_time": price_most_time,
-        "max_group_ticks": acc["max_group_ticks"],
-    }
-    # Volume info
+
+    def _safe_div(a, b, default=0.0):
+        b = float(b)
+        return float(a) / b if abs(b) > 1e-12 else float(default)
+    
+    # --- preço mais negociado / maior volume / mais tempo (WDO) ---
+    def _argmax(d: Dict[float, float]) -> Tuple[Optional[float], float]:
+        if not d: return None, 0.0
+        k, v = max(d.items(), key=lambda kv: kv[1])
+        return k, float(v)
+
+    price_most_traded, _ = _argmax(acc["price_count"])
+    price_most_volume, _ = _argmax(acc["price_vol"])
+    price_most_time,   _ = _argmax(acc["secs_at_price"])
+
+    # Chaves básicas do evento (seguindo seu step simplificado)
+    p_open  = float(ev.get("open", 0.0))
+    p_close = float(ev.get("close", 0.0))
+    p_high  = float(ev.get("max", 0.0))
+    p_low   = float(ev.get("min", 0.0))
+    dur     = int(ev.get("dur", 0))
+    rng     = ev.get("range")
+    dp = p_open - p_close
+    dmx = p_open - p_high
+    dmm = p_open - p_low
+    dmt = p_open - price_most_traded
+    dmv = p_open - price_most_volume
+
     buy_a, sell_a, tot_a = acc["buy_vol_a"], acc["sell_vol_a"], acc["tot_vol_a"]
     buy_b, sell_b, tot_b = acc["buy_vol_b"], acc["sell_vol_b"], acc["tot_vol_b"]
-    tot_all = tot_a + tot_b
-    n_orders = max(1.0, float(acc["orders_started_sum"]))
-    ev["volume_info"] = {
-        "buy_vol": buy_a + buy_b,
-        "sell_vol": sell_a + sell_b,
-        "total_vol_incl_cross": tot_all,
-        "avg_vol_per_order": tot_all / n_orders,
-        "max_group_vol": acc["max_group_lot"],
-    }
-    # Trade info
-    ev["trade_info"] = {
-        "groups_buy": acc["g_buy"],
-        "groups_sell": acc["g_sell"],
-        "groups_neutral": acc["g_neu"],
-        "rate_avg": acc["orders_started_sum"] / max(1, int(ev["dur"])),
-        "rate_max": acc["rate_max"],
-        "max_streak_buy": acc["max_streak_buy"],
-        "max_streak_sell": acc["max_streak_sell"],
-    }
-    # Movement info
-    def _abs_dtk(p0: Optional[float], p1: Optional[float], tk: float) -> float:
-        if p0 is None or p1 is None or not tk or tk <= 0:
-            return 0.0
-        return abs((float(p1) - float(p0)) / float(tk))
-    dtk_a = _abs_dtk(ev.get("p0_a"), ev.get("plast_a"), tick_a)
-    dtk_b = _abs_dtk(ev.get("p0_b"), ev.get("plast_b"), tick_b)
-    def _vol_per_tick_stats(persec: List[Dict[str, float]], symbol: str) -> Tuple[Dict[str, float], Dict[str, float]]:
-        vals_up: List[float] = []
-        vals_dn: List[float] = []
-        for r in persec:
-            if symbol == "a":
-                dtk = r["dtk_a"]
-                buy = r["buy_a"]
-                sell = r["sell_a"]
-            else:
-                dtk = r["dtk_b"]
-                buy = r["buy_b"]
-                sell = r["sell_b"]
-            adtk = abs(dtk)
-            if adtk <= 0:
-                continue
-            if dtk > 0 and buy > 0:
-                vals_up.append(buy / adtk)
-            if dtk < 0 and sell > 0:
-                vals_dn.append(sell / adtk)
-        def _stats(lst: List[float]) -> Dict[str, object]:
-            if not lst:
-                return {"mean": 0.0, "min": 0.0, "max": 0.0, "n": 0}
-            arr = np.asarray(lst, dtype=float)
-            return {
-                "mean": float(arr.mean()),
-                "min": float(arr.min()),
-                "max": float(arr.max()),
-                "n": int(arr.size),
-            }
-        return _stats(vals_up), _stats(vals_dn)
-    up_a, dn_a = _vol_per_tick_stats(acc["persec"], "a")
-    up_b, dn_b = _vol_per_tick_stats(acc["persec"], "b")
-    # Participation of WDO in displacement (per side)
-    buy_share_a = (buy_a / (buy_a + buy_b)) if (buy_a + buy_b) > 0 else 0.0
+    tot_all = float(tot_a + tot_b)
+    n_orders_avg_base = max(1.0, float(acc["orders_started_sum"]))  # soma das taxas por segundo
+
+
+    # 4) Movimento
+    # 4.1 variações por tick/volume separados (WDO/DOL; up usa buy, down usa sell)
+    up_a: List[float] = []; dn_a: List[float] = []
+    up_b: List[float] = []; dn_b: List[float] = []
+    for r in acc["persec"]:
+        dtk_a = float(r["dtk_a"]); dtk_b = float(r["dtk_b"])
+        if   dtk_a > 0 and dtk_a != 0: up_a.append(float(r["buy_a"])  / abs(dtk_a))
+        elif dtk_a < 0 and dtk_a != 0: dn_a.append(float(r["sell_a"]) / abs(dtk_a))
+        if   dtk_b > 0 and dtk_b != 0: up_b.append(float(r["buy_b"])  / abs(dtk_b))
+        elif dtk_b < 0 and dtk_b != 0: dn_b.append(float(r["sell_b"]) / abs(dtk_b))
+
+    # 4.2 shares de participação do WDO no deslocamento (por lado)
+    buy_share_a  = (buy_a / (buy_a + buy_b)) if (buy_a + buy_b) > 0 else 0.0
     sell_share_a = (sell_a / (sell_a + sell_b)) if (sell_a + sell_b) > 0 else 0.0
-    # Absorption stats
+
+    # 4.3 absorção
     def _abs_stats(lst: List[Dict[str, float]]) -> Dict[str, float]:
         if not lst:
             return {"count": 0, "ticks_mean": 0.0, "ticks_max": 0.0, "vel_mean": 0.0}
         ticks = np.asarray([x["ticks"] for x in lst], dtype=float)
-        vels = np.asarray([x["ticks"] / max(1, x["secs"]) for x in lst], dtype=float)
-        return {
-            "count": len(lst),
-            "ticks_mean": float(ticks.mean()),
-            "ticks_max": float(ticks.max()),
-            "vel_mean": float(vels.mean()),
-        }
+        vels  = np.asarray([x["ticks"]/max(1, x["secs"]) for x in lst], dtype=float)
+        return {"count": len(lst), "ticks_mean": float(ticks.mean()), "ticks_max": float(ticks.max()), "vel_mean": float(vels.mean())}
+
     abs_buy = _abs_stats(acc["absorb_buy"])
-    abs_sell = _abs_stats(acc["absorb_sell"])
-    # Ease of movement
-    use_a = (p.price_ref_symbol.lower() == "a")
-    ref_tick = tick_a if use_a else tick_b
-    ref_open = ev.get("p0_a") if use_a else ev.get("p0_b")
-    ref_close = ev.get("plast_a") if use_a else ev.get("plast_b")
-    net_ticks = _abs_dtk(ref_open, ref_close, ref_tick)
-    dir_sign = 0
-    if ref_open is not None and ref_close is not None:
-        diff = float(ref_close) - float(ref_open)
-        dir_sign = 1 if diff > 0 else (-1 if diff < 0 else 0)
+    abs_sell= _abs_stats(acc["absorb_sell"])
+
+    # 4.4 facilidade do deslocamento (ref WDO)
+    net_ticks = abs(ticks_delta(p_open, p_close, tick_a))
+    dir_sign = 1 if (p_close - p_open) > 0 else (-1 if (p_close - p_open) < 0 else 0)
     opp_vol = (sell_a + sell_b) if dir_sign > 0 else ((buy_a + buy_b) if dir_sign < 0 else 0.0)
     ease_of_move = (net_ticks / max(1.0, opp_vol)) if dir_sign != 0 else 0.0
+
     ev["move_info"] = {
-        "range_ticks": ev.get("range_ticks", 0.0),
-        "d_ticks_max": ev.get("d_ticks_max", 0.0),
-        "dtk_open_close_a": dtk_a,
-        "dtk_open_close_b": dtk_b,
-        "vol_per_tick_up_a": up_a,
-        "vol_per_tick_dn_a": dn_a,
-        "vol_per_tick_up_b": up_b,
-        "vol_per_tick_dn_b": dn_b,
-        "buy_share_wdo": buy_share_a,
-        "sell_share_wdo": sell_share_a,
-        "absorptions_buy": abs_buy,
+        "range_ticks": ticks_delta(p_low, p_high, tick_a),
+        "d_ticks_max": float(acc["max_group_ticks"]),
+        "vol_per_tick_up_a":  _stats_list(up_a),
+        "vol_per_tick_dn_a":  _stats_list(dn_a),
+        "vol_per_tick_up_b":  _stats_list(up_b),
+        "vol_per_tick_dn_b":  _stats_list(dn_b),
+        "buy_share_wdo":  float(buy_share_a),
+        "sell_share_wdo": float(sell_share_a),
+        "absorptions_buy":  abs_buy,
         "absorptions_sell": abs_sell,
-        "ease_of_move": ease_of_move,
+        "ease_of_move": float(ease_of_move),
     }
-    # Players info
+
+    # 5) Players (tops do dia)
     ev["players_info"] = {
-        "top_buy_vol_wdo": acc["top_buy_vol_a"],
-        "top_sell_vol_wdo": acc["top_sell_vol_a"],
-        "top_buy_vol_dol": acc["top_buy_vol_b"],
-        "top_sell_vol_dol": acc["top_sell_vol_b"],
+        "top_buy_vol_wdo": float(acc["top_buy_vol_a"]),
+        "top_sell_vol_wdo": float(acc["top_sell_vol_a"]),
+        "top_buy_vol_dol": float(acc["top_buy_vol_b"]),
+        "top_sell_vol_dol": float(acc["top_sell_vol_b"]),
+        # numero de players diferente
     }
-    # Context info
-    use_a = (p.price_ref_symbol.lower() == "a")
-    ctx_price = ev.get("plast_a") if use_a else ev.get("plast_b")
-    if ctx_price is None:
-        ctx_price = ev.get("plast_b") if use_a else ev.get("plast_a")
-    if ctx_price is None:
-        ctx_price = 0.0
-    if use_a:
-        sma15m = _safe_mean(getattr(metrics, "buf15_a", []), ctx_price)
-    else:
-        sma15m = _safe_mean(getattr(metrics, "buf15_b", []), ctx_price)
-    try:
-        ctx_feats = extrair_preco_fn(np.array([float(ctx_price)], dtype=float))[0].tolist()
-    except Exception:
-        ctx_feats = [0.0] * 5
-    ev["context_info"] = {
-        "ctx_price": float(ctx_price),
-        "ema_vol_sec": float(getattr(metrics, "ema_vol_sec", 0.0) or 0.0),
+
+    # SMA 15m do preço do WDO usando buffer de 30m do metrics (1Hz). Janela = 900s.
+    d5m = p_close - metrics.mean_price_5m
+    d30 = p_close - metrics.mean_price_30m
+        
+    dvwap = p_close - metrics.vwap
+    ddayo = p_close - metrics.abertura
+
+    ctx_price = p_close  # último preço WDO do evento
+    ctx_feats = extrair_preco_fn(np.array([float(ctx_price)], dtype=float))[0].tolist()
+
+
+    ev["vector"] = {
+        "dt": dur,
+        "dp": dp,
+        "dmx": dmx,
+        "dmm": dmm,
+        "dmt": dmt,
+        "dmv": dmv,
+        "dvwap": dvwap,
+        "ddayo": ddayo,
+        "d5m": d5m,
+        "d30m": d30,
+        "efrang": abs(p_close-p_open) / min(0.1, rng), #eficiencia de range
+        "pctx0": ctx_feats[0],
+        "pctx1": ctx_feats[1],
+        "pctx2": ctx_feats[2],
+        "pctx3": ctx_feats[3],
+        "pctx4": ctx_feats[4],
+        "b_vol": buy_a + buy_b,
+        "s_vol": sell_a + sell_b,
+        "t_vol": tot_all,
+        "d_vol": buy_a+buy_b-sell_a-sell_b,
+        "avg_vol": (tot_all / n_orders_avg_base),
+        "g_b":   int(acc["g_buy"]), #grupos buy
+        "g_s":  int(acc["g_sell"]), #grupos sell
+        "g_n": int(acc["g_neu"]),   #grupos neutro
+        "rate_avg": (float(acc["orders_started_sum"]) / max(1, dur)),
+        "max_streak_buy":  int(acc["max_streak_buy"]),
+        "max_streak_sell": int(acc["max_streak_sell"]),
+        "ema_vol_total": float(getattr(metrics, "ema_vol_total", 0.0) or 0.0),
         "ema_order_rate": float(getattr(metrics, "ema_order_rate", 0.0) or 0.0),
-        "sma15m_price_wdo": float(sma15m),
-        "price_feats": ctx_feats,
-        "active_flags": list(ev.get("start_flags", {}).keys()),
-        "end_flags": ev.get("end_reason", ""),
+
     }
+
     return ev
 
+# ===== dataclass de parâmetros =====
+@dataclass
+class SegParams:
+    """Hyperparameters controlling event segmentation.
+
+    These parameters tune the behaviour of the event detection
+    algorithm. They correspond closely to the variables in the original
+    implementation but have been grouped into a dataclass for
+    readability and ease of configuration. See the original code for
+    descriptions of each field.
+    """
+    
+    # tick sizes and lot multipliers for symbols A and B
+    tick_a: float = 0.5
+    tick_b: float = 0.5
+    lot_mult_a: float = 1.0
+    lot_mult_b: float = 5.0
+
+    # EMAs for volume, range and order rate (time constants in minutes)
+    tau_vol_min: float = 1.0
+    tau_var_min: float = 1.0
+    tau_order_min: float = 1.0
+
+    end_grace_s: int = 1  # inclui +1 segundo no próprio evento antes de encerrar
+    # Maximum event duration (seconds)
+    max_dur_s: int = 120
+
+    # Absorption detection thresholds
+    absorb_ticks_thr: int = 2
+
+    player_vol_mult: float = 2.0  # fator K do limiar: K * mean_vol_5m
+    vol_spike_mult: float = 2.0    # multiplicador K para o spike de volume
+    vol_spike_mult_cum: float = 8.0 # multiplicador K para o spike acumulado de volume
+    range_decay_tau_s: float = 120.0 # (DECAIMENTO) constante de tempo (seg) da exponencial
+    range_div: float = 2.0
+    # Speed (taxa de variação)
+    speed_win_s: int = 3        # janela curta dentro do evento (ex.: 5 segundos)
+    speed_mult: float = 3.0     # multiplicador K para disparo: speed_evt >= K * mean_speed_5m
+    rate_mult: float = 7.0  # fator K para o corte de order rate
+    rate_mult_evt: float = 2.0  # fator K para o corte de order rate dentro do evento
+
+    # Which symbol to use as the price reference ("a" for WDO/WIN or "b" for DOL/IND)
+    price_ref_symbol: str = "a"
+
+    # Top players of the day (optional)
+    top_buyers_a: Tuple[int, ...] = ()
+    top_sellers_a: Tuple[int, ...] = ()
+    top_buyers_b: Tuple[int, ...] = ()
+    top_sellers_b: Tuple[int, ...] = ()
+
+    # ----------------------------------------------------------
+    # >>> Fábricas de configuração por ativo <<<
+    # ----------------------------------------------------------
+    @classmethod
+    def for_indice(cls) -> "SegParams":
+        """Configuração típica para IND/WIN"""
+        return cls(
+            tick_a=5.0,
+            tick_b=5.0,
+            lot_mult_a=1.0,
+            lot_mult_b=5.0,
+            max_dur_s=120,
+            vol_spike_mult=3.0,
+            vol_spike_mult_cum=10.0,
+            player_vol_mult=2.0,
+            speed_win_s=2,
+            speed_mult=2.0,
+            rate_mult=6.0,
+            range_decay_tau_s=120.0,
+            price_ref_symbol="a",
+        )
+
+def detect_player_big_hit(orders_a, orders_b, metrics, params) -> bool:
+    """
+    Dispara True se QUALQUER ordem agregada (A ou B), ponderada por lot_mult,
+    for >= K * média de 5min do volume (também por segundo).
+    K = params.player_vol_mult
+    """
+    # base = média de 5min; se ainda zero (aquecimento), usa EMA curta
+    base = float(metrics.ema_vol_total)
+    if base <= 0.0:
+        base = float(metrics.ema_vol_sec)
+    if base <= 0.0:
+        return False  # sem base ainda, não dispara
+
+    thr = float(params.player_vol_mult) * base
+
+    ret = False
+    # varre A (ponderado por lot_mult_a)
+    if orders_a:
+        for o in orders_a:
+            lot_eff = float(o.get("lot", 0.0))
+            if lot_eff >= thr / 2.0:
+                # print(f"player wdo: {lot_eff} thr: {thr}")
+                ret = True
+
+    # varre B (ponderado por lot_mult_b)
+    if orders_b:
+        for o in orders_b:
+            lot_eff = float(o.get("lot", 0.0))
+            if lot_eff >= thr:
+                # print(f"player dol: {lot_eff / 5} thr: {thr}")
+                ret = True
+
+
+    return ret
+
+def detect_vol_spike_two_conditions(
+    vol_inst: float,
+    vol_cum: float,
+    metrics,
+    params,
+) -> bool:
+    """
+    Retorna: (inst_hit, cum_hit, thr)
+      - inst_hit: volume total do segundo >= K * média 5m
+      - cum_hit : volume acumulado dentro do segundo cruzou K * média em algum ponto
+      - thr     : limiar usado (K * base)
+
+    Pré-requisito: trades_a e trades_b já com lot multiplicado (t[1]).
+    """
+    # base do limiar
+    base = float(metrics.ema_vol_total)
+    if base <= 0.0:
+        base = float(metrics.ema_vol_sec)
+    if base <= 0.0:  # sem base numérica ainda
+        return False
+
+    K0 = float(params.vol_spike_mult)
+    thr0 = K0 * base
+    K1 = float(params.vol_spike_mult_cum)
+    thr1 = K1 * base
+    # (1) condição instantânea
+    inst_hit = float(vol_inst) >= thr0
+    # if inst_hit:
+    #     print(f"vol_inst: {vol_inst} thr0: {thr0}")
+
+    # (2) condição acumulada no evento
+    cum_hit = float(vol_cum) >= thr1
+    # if cum_hit:
+    #     print(f"vol_cum: {vol_cum} thr1: {thr1}")
+
+    return inst_hit | cum_hit
+
+def detect_range_hit(range, dur, metrics, params: "SegParams") -> bool:
+
+    # base de comparação: range_5m das métricas (se zero no warm-up, usa range_30m como fallback)
+    base_range = float(metrics.range_5m)
+
+    if base_range <= 0.0:
+        return False  # sem base confiável ainda
+
+    Kt = math.exp(-dur / params.range_decay_tau_s)
+    thr = Kt * base_range / params.range_div
+
+    # if range >= thr:
+    #     print(f"range: {range} thr: {thr} dur: {dur} base_range: {base_range}")
+
+    # dispara quando o range do evento ultrapassa o threshold dinâmico
+    return range >= thr
+
+def detect_speed_hit(metrics: "RefMetrics", evt: dict, params: "SegParams", min_a, max_a, last_close) -> bool:
+    """
+    Dispara se speed_evt >= K * mean_speed_5m.
+    Usa mean_speed_5m como baseline; se zero, usa ema_speed_sec.
+    """
+    if max_a is not None and min_a is not None and last_close is not None:
+        dpx = abs(float(max_a) - float(min_a))
+        dpx = max(dpx, abs(float(last_close) - float(min_a)))
+        dpx = max(dpx, abs(float(last_close) - float(max_a)))
+    else:
+        dpx = 0.0
+    
+    # baseline
+    base = float(metrics.mean_speed_5m)
+    if base <= 0.0:
+        base = float(metrics.ema_speed_sec)
+    if base <= 0.0:
+        return False  # sem baseline ainda
+
+    K = float(params.speed_mult)
+    thr = K * base
+
+    # if dpx >= thr:
+    #     print(f"speed_evt: {dpx} thr: {thr}")
+
+    return dpx >= thr
+
+def detect_order_rate_cut_simple(metrics, evt, n_orders: int, params) -> bool:
+    # baseline de ordens/s
+    base = float(metrics.mean_ord_5m)
+    if base <= 0.0:
+        base = float(metrics.ema_order_rate)
+    if base <= 0.0:
+        return False  # sem baseline ainda
+
+    thr = float(params.rate_mult) * base
+    thr2 = float(params.rate_mult_evt) * base
+
+    # condição 1: taxa instantânea no segundo (ordens/s)
+    sec_hit = float(n_orders) >= thr
+
+    # condição 2: taxa média do evento (ordens acumuladas / duração em s)
+    evt_hit = False
+    if evt is not None:
+        evt_n = float(evt.get("n_trades", 0))
+        evt_dur = float(evt.get("dur", 0.0))
+        if evt_dur > 0.0:
+            evt_rate = evt_n / evt_dur
+            evt_hit = evt_rate >= thr2
+
+    return sec_hit or evt_hit
+
+class RenkoBuilder:
+    def __init__(self, brick_size: float, reversal_bricks: int = 2, anchor_mode: str = "round"):
+        self.brick_size = float(brick_size)
+        self.reversal_bricks = int(reversal_bricks)
+        self.anchor_mode = anchor_mode
+        self.reset()
+
+    def reset(self, anchor_price: float = None):
+        self.last = None if anchor_price is None else self._anchor_to_grid(anchor_price)
+        self.dir = 0                # +1 up, -1 down, 0 neutro
+        self.closes = []            # preços de fechamento dos tijolos
+        self.dirs = []              # direções dos tijolos (+1/-1)
+        self.brick_times = []       # timestamps dos tijolos (quando fecharam)
+        self.inversion_times = []  # ← NOVO
+        self._last_brick_dir = 0
+        self._inversion_hit = False
+
+    def _anchor_to_grid(self, price: float) -> float:
+        b = self.brick_size
+        if self.anchor_mode == "round":
+            return round(price / b) * b
+        elif self.anchor_mode == "floor":
+            return math.floor(price / b) * b
+        return price
+
+    def _mark_brick(self, d: int, t=None):
+        # detectar inversão (+1 → -1 ou -1 → +1)
+        if self._last_brick_dir != 0 and d != self._last_brick_dir:
+            self._inversion_hit = True
+            if t is not None:
+                self.inversion_times.append(t)  # ← guarda o tempo da inversão
+        self._last_brick_dir = d
+        self.dirs.append(d)
+        self.brick_times.append(t)
+
+    def update_tick(self, price: float, t=None):
+        if self.last is None:
+            self.last = self._anchor_to_grid(price)
+            return
+        b, rev = self.brick_size, self.reversal_bricks
+
+        # Sobe tijolos
+        while price >= self.last + (b if self.dir >= 0 else b * rev):
+            self.last += b
+            self.dir = +1
+            self.closes.append(self.last)
+            self._mark_brick(+1, t=t)
+
+        # Desce tijolos
+        while price <= self.last - (b if self.dir <= 0 else b * rev):
+            self.last -= b
+            self.dir = -1
+            self.closes.append(self.last)
+            self._mark_brick(-1, t=t)
+
+    def pull_inversion_hit(self) -> bool:
+        hit = self._inversion_hit
+        self._inversion_hit = False
+        return hit
+    
+def feed_renko_from_trades(renko: RenkoBuilder, trades, price_idx=0, t_seconds=None):
+    """
+    trades: lista de trades do segundo (em ordem). Se t_seconds (epoch do segundo) for dado,
+            espelha cada trade como t_seconds + frac.
+    """
+    n = len(trades)
+    if n == 0:
+        return
+    for k, rec in enumerate(trades):
+        price = float(rec[price_idx])
+        t = None
+        if t_seconds is not None:
+            frac = (k + 1) / (n + 1)   # 0<frac<1
+            t = t_seconds + frac
+        renko.update_tick(price, t=t)
+
+def renko_step_series(renko: RenkoBuilder, last_time=None):
+    """
+    Constrói (xs, ys) para um gráfico em 'escada' (passo) do Renko no tempo.
+    last_time: se quiser estender o último degrau até 'agora' (timestamp float).
+    """
+    xs = []
+    ys = []
+    if not renko.closes:
+        return xs, ys
+
+    closes = renko.closes
+    times = renko.brick_times
+
+    # Garante que tempos sejam floats (epoch)
+    times = [float(t) if t is not None else None for t in times]
+
+    # Primeiro degrau começa no tempo do primeiro tijolo
+    for i in range(len(closes)):
+        t_i = times[i]
+        y_i = closes[i]
+        if t_i is None:
+            continue
+        # ponto de “subida” do degrau
+        xs.append(datetime.fromtimestamp(t_i, tz=timezone.utc).astimezone(LOCAL_TZ))
+        ys.append(y_i)
+        # mantém até o próximo tempo (repetindo y)
+        t_next = times[i+1] if i+1 < len(times) else None
+        if t_next is not None:
+            xs.append(datetime.fromtimestamp(t_next, tz=timezone.utc).astimezone(LOCAL_TZ))
+            ys.append(y_i)
+        elif last_time is not None:
+            xs.append(datetime.fromtimestamp(float(last_time), tz=timezone.utc).astimezone(LOCAL_TZ))
+            ys.append(y_i)
+
+    return xs, ys
+
+def plot_renko_realtime_with_close(renko: RenkoBuilder, t_close, close_a_vals,
+                                   title="Renko (tempo real) + close_a"):
+    """Plota Renko + close_a, marcando inversões de direção."""
+    # --- limpar valores inválidos ---
+    valid = [(t, p) for t, p in zip(t_close, close_a_vals) if p is not None]
+    if not valid:
+        print("Sem dados válidos de close_a para plot.")
+        return
+
+    t_close, close_a_vals = zip(*valid)
+    xs_close = [datetime.fromtimestamp(float(t), tz=timezone.utc).astimezone(LOCAL_TZ) for t in t_close]
+    ys_close = [float(p) for p in close_a_vals]
+
+    last_t = float(t_close[-1])
+    xs_r, ys_r = renko_step_series(renko, last_time=last_t)
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    if xs_r:
+        ax.step(xs_r, ys_r, where="post", linewidth=2.0, label=f"Renko {renko.brick_size:g}p")
+
+    # --- linha do close_a ---
+    ax.plot(xs_close, ys_close, linewidth=1.0, alpha=0.65, color="tab:blue", label="close_a")
+
+    # --- marcações de inversão ---
+    if renko.inversion_times:
+        inv_x = [datetime.fromtimestamp(float(t), tz=timezone.utc).astimezone(LOCAL_TZ)
+                 for t in renko.inversion_times]
+        inv_y = [renko.last] * len(inv_x)  # ou usar valor médio dos últimos tijolos
+        ax.scatter(inv_x, inv_y, color="black", marker="v", s=60, label="Inversão")
+
+    # --- estética ---
+    ax.set_title(title)
+    ax.set_xlabel("tempo (America/Sao_Paulo)")
+    ax.set_ylabel("preço")
+    ax.grid(True, alpha=0.25)
+    loc = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(loc)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+    ax.legend()
+    fig.tight_layout()
+    plt.show()
+
+def pick_end_causes(cause_flags: dict[str, bool], cause_order: list[str]) -> list[str]:
+    """Retorna TODAS as causas ativas (True) na ordem de prioridade."""
+    return [k for k in cause_order if cause_flags.get(k, False)]
+
+def push_end_reasons(evt: dict, causes: list[str]) -> None:
+    """Acrescenta causas em evt['end_reason'] sem duplicar, preservando a ordem."""
+    if not evt or not causes:
+        return
+    lst = evt.setdefault("end_reason", [])
+    for c in causes:
+        if c not in lst:
+            lst.append(c)
+
+@dataclass
+class RefMetrics:
+    """Métricas de referência e médias móveis (5 min e 30 min) + VWAP."""
+
+    alpha_vol: float
+    alpha_var: float
+    alpha_rate: float
+
+    # EMAs rápidas
+    ema_vol_sec: float = 0.0
+    ema_vol_total: int = 0
+    ema_order_rate: float = 0.0
+
+    # tempo
+    tempo_total: int = 0
+
+    #abertura
+    abertura: float = 0.0
+
+    # Buffers de preço
+    buf_5m: List[float] = field(default_factory=list)
+    buf_30m: List[float] = field(default_factory=list)
+
+    buf_max_5m: List[float] = field(default_factory=list)
+    buf_min_5m: List[float] = field(default_factory=list)
+    buf_max_30m: List[float] = field(default_factory=list)
+    buf_min_30m: List[float] = field(default_factory=list)
+
+    # Buffers de volume e ordens
+    buf_vol_5m: List[float] = field(default_factory=list)
+    buf_vol_30m: List[float] = field(default_factory=list)
+    buf_ord_5m: List[float] = field(default_factory=list)
+    buf_ord_30m: List[float] = field(default_factory=list)
+
+    # Acumuladores VWAP
+    cum_vol: float = 0.0
+    cum_vwap_num: float = 0.0
+
+    # Resultados calculados
+    mean_price_5m: float = 0.0
+    mean_price_30m: float = 0.0
+    vwap: float = 0.0
+    mean_vol_5m: float = 0.0
+    mean_vol_30m: float = 0.0
+    mean_ord_5m: float = 0.0
+    mean_ord_30m: float = 0.0
+    range_5m: float = 0.0
+    range_30m: float = 0.0
+
+    # --- Volatilidade ---
+    prev_close: Optional[float] = None
+    var_ema: float = 0.0          # EMA da variância dos retornos
+    vol_ema: float = 0.0          # sqrt(var_ema)
+    buf_ret2_5m: List[float] = field(default_factory=list)   # últimos 300s de ret^2
+    buf_ret2_30m: List[float] = field(default_factory=list)  # últimos 1800s de ret^2
+    vol_sma_5m: float = 0.0
+    vol_sma_30m: float = 0.0
+
+    # --- Speed (magnitude da variação por segundo) ---
+    prev_close: Optional[float] = None         # se já não existir
+    ema_speed_sec: float = 0.0                 # EMA de |Δpreço|/s (usa alpha_var como time-constant)
+    buf_speed_5m: List[float] = field(default_factory=list)   # últimos 300s de |Δpreço|
+    buf_speed_30m: List[float] = field(default_factory=list)  # últimos 1800s de |Δpreço|
+    mean_speed_5m: float = 0.0
+    mean_speed_30m: float = 0.0
+
+    # HISTÓRICO para plot (novo)
+    hist: Dict[str, List[float]] = field(
+        default_factory=lambda: {
+            "t": [],
+            "close": [],
+            "vwap": [],
+            "mean_price_5m": [],
+            "mean_price_30m": [],
+            "ema_vol_sec": [],
+            "mean_vol_5m": [],
+            "mean_vol_30m": [],
+            "ema_order_rate": [],
+            "mean_ord_5m": [],
+            "mean_ord_30m": [],
+            "range_5m": [],
+            "range_30m": [],
+            "vol_ema": [],
+            "vol_sma_5m": [],
+            "vol_sma_30m": [],
+            "speed_ema_sec": [],
+            "mean_speed_5m": [],
+            "mean_speed_30m": [],
+        }
+    )
+
+    @classmethod
+    def create(cls, tau_vol_min: float, tau_var_min: float, tau_order_min: float) -> "RefMetrics":
+        a_vol = 1.0 - math.exp(-1.0 / max(1.0, tau_vol_min * 60.0))
+        a_var = 1.0 - math.exp(-1.0 / max(1.0, tau_var_min * 60.0))
+        a_rate = 1.0 - math.exp(-1.0 / max(1.0, tau_order_min * 60.0))
+        return cls(a_vol, a_var, a_rate)
+
+    def setopenday(self, pa, pb):
+        p = pa if pa is not None else pb
+        self.abertura = p 
+
+    def update(self,
+               close: Optional[float],
+               vol: float,
+               n_orders: float,
+               max_a: float = 0.0,
+               min_a: float = 0.0) -> None:
+        """Atualiza métricas a cada segundo."""
+
+        # Volume EMA (curto prazo)
+        self.ema_vol_sec = (1.0 - self.alpha_vol) * self.ema_vol_sec + self.alpha_vol * float(vol)
+        # --- EMA de taxa de ordens ---
+        self.ema_order_rate = (1.0 - self.alpha_rate) * self.ema_order_rate + self.alpha_rate * float(n_orders)
+
+        # --- Atualiza buffers de preço ---
+        if close is not None:
+            self.buf_5m.append(close)
+            self.buf_30m.append(close)
+            self.buf_5m = self.buf_5m[-300:]      # 5 min a 1 Hz
+            self.buf_30m = self.buf_30m[-1800:]   # 30 min
+
+        # -- Atualiza buffers de preço com max/min do segundo ---
+        if max_a is not None and min_a is not None:
+            self.buf_max_5m.append(max_a)
+            self.buf_min_5m.append(min_a)
+            self.buf_max_30m.append(max_a)
+            self.buf_min_30m.append(min_a)
+            self.buf_max_5m = self.buf_max_5m[-300:]
+            self.buf_min_5m = self.buf_min_5m[-300:]
+            self.buf_max_30m = self.buf_max_30m[-1800:]
+            self.buf_min_30m = self.buf_min_30m[-1800:]
+
+        # --- VWAP ---
+        if vol > 0 and close is not None:
+            self.cum_vol += vol
+            self.cum_vwap_num += close * vol
+            self.vwap = self.cum_vwap_num / max(self.cum_vol, 1e-12)
+
+        # --- Media de volume ---
+        self.tempo_total += 1
+        self.ema_vol_total = float(self.cum_vol) / self.tempo_total
+
+        # --- Buffers de volume e ordens ---
+        self.buf_vol_5m.append(vol)
+        self.buf_vol_30m.append(vol)
+        self.buf_vol_5m = self.buf_vol_5m[-300:]
+        self.buf_vol_30m = self.buf_vol_30m[-1800:]
+
+        self.buf_ord_5m.append(n_orders)
+        self.buf_ord_30m.append(n_orders)
+        self.buf_ord_5m = self.buf_ord_5m[-300:]
+        self.buf_ord_30m = self.buf_ord_30m[-1800:]
+
+        # --- Médias simples ---
+        self.mean_price_5m = float(np.mean(self.buf_5m)) if self.buf_5m else 0.0
+        self.mean_price_30m = float(np.mean(self.buf_30m)) if self.buf_30m else 0.0
+        self.mean_vol_5m = float(np.mean(self.buf_vol_5m)) if self.buf_vol_5m else 0.0
+        self.mean_vol_30m = float(np.mean(self.buf_vol_30m)) if self.buf_vol_30m else 0.0
+        self.mean_ord_5m = float(np.mean(self.buf_ord_5m)) if self.buf_ord_5m else 0.0
+        self.mean_ord_30m = float(np.mean(self.buf_ord_30m)) if self.buf_ord_30m else 0.0
+
+        # --- Range máximo (5m e 30m) ---
+        def calc_range(buf_max, buf_min):
+            return (max(buf_max) - min(buf_min)) if len(buf_max) >= 2 else 0.0
+
+        self.range_5m = calc_range(self.buf_max_5m, self.buf_min_5m)
+        self.range_30m = calc_range(self.buf_max_30m, self.buf_min_30m)
+
+        # --- Retorno log por segundo (se possível) ---
+        ret = None
+        if close is not None and self.prev_close is not None and self.prev_close > 0:
+            ret = math.log(close / self.prev_close)
+
+        # --- EMA da variância e SMAs de volatilidade ---
+        if ret is not None:
+            r2 = ret * ret
+            # EMA da variância
+            self.var_ema = (1.0 - self.alpha_var) * self.var_ema + self.alpha_var * r2
+            self.vol_ema = math.sqrt(max(self.var_ema, 0.0))
+
+            # Buffers janelados (5m/30m)
+            self.buf_ret2_5m.append(r2)
+            self.buf_ret2_30m.append(r2)
+            self.buf_ret2_5m  = self.buf_ret2_5m[-300:]
+            self.buf_ret2_30m = self.buf_ret2_30m[-1800:]
+
+            # Vols SMA (desvio-padrão da janela)
+            self.vol_sma_5m  = math.sqrt(float(np.mean(self.buf_ret2_5m)))  if self.buf_ret2_5m  else 0.0
+            self.vol_sma_30m = math.sqrt(float(np.mean(self.buf_ret2_30m))) if self.buf_ret2_30m else 0.0
+
+        # --- Speed: |Δpreço| por segundo ---
+        if close is not None and self.prev_close is not None:
+            dpx = abs(float(max_a) - float(min_a))
+            dpx = max(dpx, abs(float(self.prev_close) - float(min_a)))
+            dpx = max(dpx, abs(float(self.prev_close) - float(max_a)))
+            # EMA rápida de speed (reaproveita alpha_var como time-constant para "velocidade")
+            self.ema_speed_sec = (1.0 - self.alpha_var) * self.ema_speed_sec + self.alpha_var * dpx
+
+            # buffers janelados
+            self.buf_speed_5m.append(dpx)
+            self.buf_speed_30m.append(dpx)
+            self.buf_speed_5m  = self.buf_speed_5m[-300:]
+            self.buf_speed_30m = self.buf_speed_30m[-1800:]
+
+            # médias simples
+            self.mean_speed_5m  = float(np.mean(self.buf_speed_5m))  if self.buf_speed_5m  else 0.0
+            self.mean_speed_30m = float(np.mean(self.buf_speed_30m)) if self.buf_speed_30m else 0.0
+
+        # Atualize prev_close no fim:
+        if close is not None:
+            self.prev_close = close
+
+    # >>> NOVO: tira um snapshot para o histórico
+    def snapshot(self, t: int, close: Optional[float]) -> None:
+        self.hist["t"].append(float(t))
+        self.hist["close"].append(float(close) if close is not None else (self.hist["close"][-1] if self.hist["close"] else 0.0))
+        self.hist["vwap"].append(float(self.vwap))
+        self.hist["mean_price_5m"].append(float(self.mean_price_5m))
+        self.hist["mean_price_30m"].append(float(self.mean_price_30m))
+        self.hist["ema_vol_sec"].append(float(self.ema_vol_sec))
+        self.hist["mean_vol_5m"].append(float(self.mean_vol_5m))
+        self.hist["mean_vol_30m"].append(float(self.mean_vol_30m))
+        self.hist["ema_order_rate"].append(float(self.ema_order_rate))
+        self.hist["mean_ord_5m"].append(float(self.mean_ord_5m))
+        self.hist["mean_ord_30m"].append(float(self.mean_ord_30m))
+        self.hist["range_5m"].append(float(self.range_5m))
+        self.hist["range_30m"].append(float(self.range_30m))
+        self.hist["vol_ema"].append(float(self.vol_ema))
+        self.hist["vol_sma_5m"].append(float(self.vol_sma_5m))
+        self.hist["vol_sma_30m"].append(float(self.vol_sma_30m))
+        self.hist["speed_ema_sec"].append(float(self.ema_speed_sec))
+        self.hist["mean_speed_5m"].append(float(self.mean_speed_5m))
+        self.hist["mean_speed_30m"].append(float(self.mean_speed_30m))
 
 @dataclass
 class EventSegmenter:
-    """Segment trade data into events based on dynamic thresholds.
 
-    The :class:`EventSegmenter` maintains state as it processes
-    trade data second by second. When certain conditions are met, it
-    closes the current event and starts a new one. The implementation is
-    derived from the original script but encapsulated to provide a
-    simpler public API. To use the segmenter:
-
-    1. Instantiate it with a :class:`SegParams` instance.
-    2. Call :meth:`reset` before beginning a new session.
-    3. For each second, call :meth:`step` with the timestamp and lists of
-       trades for symbols A and B. It returns a list of events that
-       ended during that second (usually zero or one).
-    4. At end of day, if an event is open, close it manually by
-       setting its ``end_reason`` and appending it to the output.
-    """
     p: SegParams
     metrics: RefMetrics = field(init=False)
     evt: Optional[Dict[str, object]] = None
@@ -654,18 +1195,22 @@ class EventSegmenter:
     _last_order_b: Optional[Dict[str, float]] = None
     rate_hi_streak: int = 0
     speed_price_streak_internal: int = 0
+    teste: int = 0
+    t_close_hist: list = field(default_factory=list)
+    close_a_hist: list = field(default_factory=list)
 
-    # Per-player state for each symbol. Each entry in the dict maps a broker
-    # identifier to a dictionary holding the current net position (``pos``),
-    # the weighted average price of the open position (``avg_price``) and
-    # the accumulated realised profit (``profit``) over the course of the
-    # day. These dictionaries are initialised lazily and maintained via
-    # :meth:`_update_player_positions`.
     player_state_a: Dict[int, Dict[str, float]] = field(default_factory=dict)
     player_state_b: Dict[int, Dict[str, float]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.metrics = RefMetrics.create(self.p.tau_vol_min, self.p.tau_var_min, self.p.tau_order_min)
+        # Decide configuração do Renko conforme ativo
+        if self.p.tick_a <= 1.0:       # Dólar / WDO / DOL
+            brick = 2.0
+        else:                          # Índice / WIN / IND
+            brick = 50.0
+
+        self.renko2 = RenkoBuilder(brick_size=brick, reversal_bricks=2)
 
     def reset(self) -> None:
         """Reset the segmenter state. Call at start of a new day."""
@@ -688,25 +1233,11 @@ class EventSegmenter:
         self.player_state_b.clear()
 
     def _update_player_positions(self, lote: float, preco: float, agc: int, agv: int, symbol: str) -> None:
-        """
-        Atualiza posição, preço médio (de zeragem) e lucro realizado por player,
-        PROCESSANDO UM ÚNICO TRADE por chamada.
 
-        Regras:
-        - agc (comprador) recebe +lote ao preço 'preco'
-        - agv (vendedor) recebe -lote ao preço 'preco'
-        - lucro realizado aparece quando a magnitude da posição diminui
-        - 1 tick = R$5 por lote; lucro = (preço_exec - avg_old) * sign(pos_old) * qty_fechada / tick * 5
-        - Quando reduz, o novo "preço médio" passa a ser o preço de zeragem:
-            avg_new = base_price - (lucro_acumulado * tick) / (tick_value * pos_new)
-            onde:
-            base_price = avg_old (se apenas reduziu sem inverter)
-            base_price = preco   (se inverteu e abriu posição oposta com sobra)
-        """
         sym_is_a = (str(symbol).lower() == "a")
         state = self.player_state_a if sym_is_a else self.player_state_b
         tick = float(self.p.tick_a) if sym_is_a else float(self.p.tick_b)
-        tick_value = 5.0  # R$/tick por lote
+        tick_value = 5.0 if sym_is_a else 25.0 # R$/tick por lote
 
         def _apply(agent_id: int, delta_pos: float) -> None:
             if agent_id is None or agent_id < 0 or delta_pos == 0.0:
@@ -725,33 +1256,32 @@ class EventSegmenter:
 
             # Caso 1: abre posição ou aumenta magnitude na mesma direção (mantém média ponderada)
             if pos_old == 0.0 or (pos_old > 0.0 and delta_pos > 0.0) or (pos_old < 0.0 and delta_pos < 0.0):
-                if abs(pos_old) < 1e-12:
-                    avg_new = float(preco)
+                if abs(pos_old) < 1e-6:
+                    avg_new = float(preco) - (prof_old*tick / (delta_pos*tick_value))
+                    prof_tot = 0.0
                 else:
                     avg_new = ((avg_old * abs(pos_old)) + (float(preco) * abs(delta_pos))) / (abs(pos_old) + abs(delta_pos))
-                prof_inc = 0.0
-                prof_tot = prof_old + prof_inc
+                    prof_tot = prof_old
 
             # Caso 2: reduz magnitude (realiza lucro/prejuízo) ou inverte
             else:
                 closing_qty = min(abs(pos_old), abs(delta_pos))
                 sign_old = 1.0 if pos_old > 0.0 else -1.0
-                prof_inc = (float(preco) - avg_old) * sign_old * closing_qty / max(tick, 1e-12) * tick_value
-                prof_tot = prof_old + prof_inc
-
+                prof_inc = (float(preco) - avg_old) * sign_old * closing_qty * tick_value / tick
+                
                 leftover = abs(delta_pos) - closing_qty  # sobra que inverte direção
-                if leftover > 1e-12:
+                if leftover > 1e-6:
                     # Inverteu: base passa a ser o preço da nova posição
-                    base_price = float(preco)
+                    avg_new = float(preco) - ((prof_old + prof_inc) * tick) / (pos_new * tick_value)
+                    prof_tot = 0.0
                 else:
-                    # Apenas reduziu sem inverter: base é a média antiga
-                    base_price = avg_old
-
-                if abs(pos_new) > 1e-12:
-                    # Preço médio de ZERAGEM incorporando lucro acumulado
-                    avg_new = base_price - (prof_tot * tick) / (tick_value * pos_new)
-                else:
-                    avg_new = 0.0  # zerou a posição
+                    if abs(pos_new) > 1e-6:
+                        # Preço médio de ZERAGEM incorporando lucro acumulado
+                        avg_new = avg_old - (prof_inc * tick) / (tick_value * pos_new)
+                        prof_tot = 0.0
+                    else:
+                        avg_new = 0.0  # zerou a posição
+                        prof_tot = prof_old + prof_inc
 
             entry["pos"] = pos_new
             entry["avg_price"] = avg_new
@@ -760,7 +1290,6 @@ class EventSegmenter:
         # Aplica comprador (+lote) e vendedor (-lote)
         _apply(int(agc), float(lote))
         _apply(int(agv), -float(lote))
-
 
     def aggregate_orders_by_player(self, trades: List[List[float]], symbol) -> List[Dict[str, float]]:
         out: List[Dict[str, float]] = []
@@ -815,263 +1344,213 @@ class EventSegmenter:
         return out
 
     def step(self, s: int, trades_a_raw: List[List[float]], trades_b_raw: List[List[float]]) -> List[Dict[str, object]]:
-        """Process trades for one second and return any completed events.
-
-        Parameters
-        ----------
-        s : int
-            The epoch second corresponding to the trades.
-        trades_a_raw : list of list of floats
-            Trades for symbol A during this second. Each row should be
-            ``[price, lot, broker_buy, broker_sell, aggressor, ...]``.
-        trades_b_raw : list of list of floats
-            Trades for symbol B during this second.
-
-        Returns
-        -------
-        list of dict
-            A list of events that ended in this step. Usually zero or one
-            event will be returned.
-        """
         # Apply lot multipliers specified in params
         trades_a = [[t[0], (t[1] * self.p.lot_mult_a)] + t[2:] for t in trades_a_raw]
         trades_b = [[t[0], (t[1] * self.p.lot_mult_b)] + t[2:] for t in trades_b_raw]
-        # Summaries for each symbol
-        smry_a = utils.summarize_second(trades_a)
-        smry_b = utils.summarize_second(trades_b)
-        close_a = smry_a["close"] if smry_a["close"] is not None else self.last_close_a
-        close_b = smry_b["close"] if smry_b["close"] is not None else self.last_close_b
-        vol_comb = smry_a["vol"] + smry_b["vol"]
-        n_orders = smry_a["n"] + smry_b["n"]
-        # Update global baselines using the combined volume and order rate
-        self.metrics.update(close_a, close_b, vol_comb, n_orders)
 
-        # Build aggregated orders by player/side for each symbol. These
-        # aggregates will be used for per-player position tracking as well
-        # as player-based decision thresholds. We compute them once here
-        # and reuse later to avoid redundant work.
+        # Summaries for each symbol
+        smry_a = summarize_second(trades_a)
+        smry_b = summarize_second(trades_b)
+
+        open_a = self.last_close_a if self.last_close_a is not None else trades_a[0][0] if trades_a else None
+        open_b = self.last_close_b if self.last_close_b is not None else trades_b[0][0] if trades_b else None
+
+        close_a = smry_a["close"] if smry_a["close"] is not None else self.last_close_a if self.last_close_a is not None else self.last_close_b
+        close_b = smry_b["close"] if smry_b["close"] is not None else self.last_close_b if self.last_close_b is not None else self.last_close_a
+
+        vol_a = smry_a["vol"]
+        vol_b = smry_b["vol"]
+
+        a_orders = smry_a["n"] 
+        b_orders = smry_b["n"]
+
+        min_a = smry_a["pmin"] if smry_a["pmin"] is not None else self.last_close_a
+        max_a = smry_a["pmax"] if smry_a["pmax"] is not None else self.last_close_a
+        min_b = smry_b["pmin"] if smry_b["pmin"] is not None else self.last_close_b
+        max_b = smry_b["pmax"] if smry_b["pmax"] is not None else self.last_close_b
+
+        min_g = min(min_a, min_b) if min_a is not None and min_b is not None else (min_a if min_a is not None else min_b)
+        max_g = max(max_a, max_b) if max_a is not None and max_b is not None else (max_a if max_a is not None else max_b)
+
         orders_a = self.aggregate_orders_by_player(trades_a, symbol="a")
         orders_b = self.aggregate_orders_by_player(trades_b, symbol="b")
 
-        # Baseline range in ticks over ~five minutes
-        ema_var5m_ticks = max(
-            self.metrics.ema_var5m / max(self.p.tick_a, 1e-9),
-            self.metrics.ema_var5m / max(self.p.tick_b, 1e-9),
-        )
-        # Renko reversal detection
-        use_a_for_renko = (self.p.renko_symbol.lower() == "a")
-        pmin = smry_a["pmin"] if use_a_for_renko else smry_b["pmin"]
-        pmax = smry_a["pmax"] if use_a_for_renko else smry_b["pmax"]
-        tick = self.p.tick_a if use_a_for_renko else self.p.tick_b
-        brick = self.p.renko_nticks * max(tick, 1e-9)
-        if getattr(self, "renko_anchor", None) is None:
-            base = close_a if use_a_for_renko else close_b
-            if base is not None:
-                self.renko_anchor = round(base / brick) * brick
-                self.renko_dir = 0
-        inv_hit = False
-        if getattr(self, "renko_anchor", None) is not None:
-            inv_hit, self.renko_anchor, self.renko_dir = renko_reversal_this_second(
-                self.renko_anchor, self.renko_dir, pmin, pmax, brick
-            )
-        # Speed per second (ticks/s)
-        def _ticks_this_sec(last_close: Optional[float], close: Optional[float], tk: float) -> float:
-            if last_close is None or close is None or tk <= 0:
-                return 0.0
-            return abs((float(close) - float(last_close)) / float(tk))
-        ticks_a_1s = _ticks_this_sec(self.last_close_a, close_a, self.p.tick_a)
-        ticks_b_1s = _ticks_this_sec(self.last_close_b, close_b, self.p.tick_b)
-        ticks_per_s_this_sec = max(ticks_a_1s, ticks_b_1s)
-        # Baseline ticks/s from range baseline over 2–5 minutes
-        base_rate_now = max(ema_var5m_ticks / 120.0, 1e-9)
-        speed_hi = (ticks_per_s_this_sec >= abs(self.p.speed_price_mult * base_rate_now))
-        self.speed_price_streak = (self.speed_price_streak + 1) if speed_hi else 0
-        speed_price_cut = (self.evt is not None) and (
-            self.evt["dur"] >= self.p.min_event_sec_speed and self.speed_price_streak >= self.p.speed_price_consec_sec
-        )
-        # Order rate thresholds
-        rate_now = float(n_orders)
-        rate_hi = (rate_now >= self.p.order_rate_mult * max(self.metrics.ema_order_rate, 1e-9))
-        self.rate_hi_streak = (self.rate_hi_streak + 1) if rate_hi else 0
-        order_rate_cut = (self.rate_hi_streak >= self.p.order_rate_consec_sec)
-        # Player vs volume thresholds
-        # Use the aggregated orders computed above to determine the maximum
-        # contiguous lot executed by any single player on both symbols.
-        max_player_lot = (
-            max([o["lot"] for o in orders_a] + [0.0]) +
-            max([o["lot"] for o in orders_b] + [0.0])
-        )
-        player_big_hit = (max_player_lot >= self.p.player_mult_vs_vol_ema * self.metrics.ema_vol_sec)
-        # Volume spike thresholds with decay within the event
-        t_evt = (self.evt["dur"] if self.evt else 0)
-        hl = self.p.decay_half_life_frac * self.p.max_dur_s
-        ema_vol_ref = (self.evt["ema_vol_start"] if self.evt else self.metrics.ema_vol_sec)
-        vol_thr_now = exp_decay_mult(t_evt, self.p.start_vol_mult * ema_vol_ref, 1.0 * ema_vol_ref, hl)
-        vol_spike_hit = (vol_comb >= vol_thr_now) or (vol_comb >= self.p.vol_1s_hard)
-        # Range cut with decay within the event
-        def _safe_span(ev_min: Optional[float], ev_max: Optional[float], snap_min: Optional[float], snap_max: Optional[float]) -> float:
-            vals: List[float] = []
-            for v in [ev_min, ev_max, snap_min, snap_max]:
-                if v is not None:
-                    vals.append(float(v))
-            return (max(vals) - min(vals)) if len(vals) >= 2 else 0.0
-        range_a_if = _safe_span(
-            self.evt["pmin_a"] if self.evt else None,
-            self.evt["pmax_a"] if self.evt else None,
-            smry_a["pmin"],
-            smry_a["pmax"],
-        )
-        range_b_if = _safe_span(
-            self.evt["pmin_b"] if self.evt else None,
-            self.evt["pmax_b"] if self.evt else None,
-            smry_b["pmin"],
-            smry_b["pmax"],
-        )
-        range_t_if = max(
-            range_a_if / max(self.p.tick_a, 1e-9),
-            range_b_if / max(self.p.tick_b, 1e-9),
-        )
-        range_baseline_ticks = max(ema_var5m_ticks, 1e-9)
-        range_thr = exp_decay_mult(
-            t_evt,
-            self.p.range_mult_start * range_baseline_ticks,
-            self.p.range_mult_end * range_baseline_ticks,
-            hl,
-        )
-        range_cut = (range_t_if >= range_thr)
-        # Max time pre‑cut
-        end_by_time_pre = (self.evt is not None) and ((self.evt["dur"] + 1) > self.p.max_dur_s)
-        # Check if we need to open first event
+        vol_comb = float(vol_a + vol_b)
+        n_orders = int(a_orders + b_orders)
+
+        # Update global baselines using the combined volume and order rate
+        self.metrics.update(close_a, vol_comb, n_orders, max_a, min_a)
+
         events_out: List[Dict[str, object]] = []
-        if self.evt is None and (smry_a["n"] + smry_b["n"]) > 0:
-            def _fallback(primary: Optional[float], *alts: Optional[float]) -> Optional[float]:
-                for v in (primary,) + alts:
-                    if v is not None:
-                        return float(v)
-                return None
-            open_a = _fallback(smry_a["open"], close_a, self.last_close_a)
-            open_b = _fallback(smry_b["open"], close_b, self.last_close_b)
+
+        # --- Renko tick-a-tick (2p) + inversão ---
+        feed_renko_from_trades(self.renko2, trades_a_raw, price_idx=0, t_seconds=float(s))
+        # if close_a is not None:
+        #     self.t_close_hist.append(s)
+        #     self.close_a_hist.append(close_a)
+        #     # plot_renko_realtime_with_close(self.renko2, self.t_close_hist, self.close_a_hist, title="Renko 2p + close_a")
+
+
+        inv_hit = self.renko2.pull_inversion_hit()
+
+        # self.metrics.snapshot(s, close_a)
+
+        # --- Abrir primeiro evento se necessário (houve trade neste segundo) ---
+        if self.evt is None and (a_orders + b_orders) > 0:
+            self.metrics.setopenday(trades_a[0][0] if len(trades_a) else None,trades_b[0][0] if len(trades_b) else None)
             self.evt = {
                 "start": s,
                 "end": s,
                 "dur": 1,
-                "p0_a": open_a,
-                "p0_b": open_b,
-                "pmin_a": smry_a["pmin"] if smry_a["pmin"] is not None else open_a,
-                "pmax_a": smry_a["pmax"] if smry_a["pmax"] is not None else open_a,
-                "pmin_b": smry_b["pmin"] if smry_b["pmin"] is not None else open_b,
-                "pmax_b": smry_b["pmax"] if smry_b["pmax"] is not None else open_b,
-                "plast_a": close_a if close_a is not None else open_a,
-                "plast_b": close_b if close_b is not None else open_b,
+                "open": open_a if open_a is not None else open_b,
+                "min": min_g,
+                "max": max_g,
+                "close": close_a if close_a is not None else close_b,
                 "vol": vol_comb,
-                "n_trades": smry_a["n"] + smry_b["n"],
-                "ema_vol_start": self.metrics.ema_vol_sec,
-                "ema_var5m_start_ticks": ema_var5m_ticks,
-                "start_reason": "bootstrap",
+                "n_trades": n_orders,
+                "range": (max_g - min_g) if (min_g is not None and max_g is not None) else 0.0,
+                "tt_a": trades_a_raw,
+                "tt_b": trades_b_raw,
+                "end_reason": [],
             }
+            # buffers/accumulators do evento (PNL, speed, etc.)
             self.evt["acc"] = event_acc_init()
+            self.evt.setdefault("speed_win_s", int(self.p.speed_win_s))  # p/ speed
+
+            # acumuladores “ricos” do seu evento
+            event_accumulate_second(
+                self.evt["acc"],
+                trades_a, trades_b,
+                smry_a, smry_b,
+                close_a, close_b,
+                self.last_close_a, self.last_close_b,
+                self.p.tick_a, self.p.tick_b,
+                smry_a["n"], smry_b["n"],
+                self.p,
+            )
+
+            # atualiza last closes e sai (evento aberto)
             self.last_close_a, self.last_close_b = close_a, close_b
-            self.speed_price_streak = 0
-            self.rate_hi_streak = 0
             return events_out
+
+        # se continua sem evento, só atualiza last closes e sai
         if self.evt is None:
             self.last_close_a, self.last_close_b = close_a, close_b
             return events_out
-        # Decision for event boundary
-        cooldown_ok = (self.last_boundary_at is None) or ((s - self.last_boundary_at) >= self.p.boundary_cooldown_s)
+
+        # --- acumular dados do segundo no evento aberto ---
+        # tempo/duração
+        self.evt["end"] = s
+        self.evt["dur"] = self.evt["end"] - self.evt["start"] + 1
+
+        # extremos/range
+        self.evt["min"] = min(self.evt["min"], min_g)
+        self.evt["max"] = max(self.evt["max"], max_g)
+        self.evt["range"] = float(self.evt["max"] - self.evt["min"])
+        self.evt["close"] = close_a if close_a is not None else close_b
+
+        # volume e ordens
+        self.evt["vol"]      += vol_comb
+        self.evt["n_trades"] += n_orders
+
+        # tt
+        self.evt["tt_a"].extend(trades_a_raw)
+        self.evt["tt_b"].extend(trades_b_raw)
+
+        # acumuladores “ricos” do seu evento
+        event_accumulate_second(
+            self.evt["acc"],
+            trades_a, trades_b,
+            smry_a, smry_b,
+            close_a, close_b,
+            self.last_close_a, self.last_close_b,
+            self.p.tick_a, self.p.tick_b,
+            smry_a["n"], smry_b["n"],
+            self.p,
+        )
+
+        # --- DETECTORES ---
+        end_by_time_pre  = (self.evt["dur"] >= self.p.max_dur_s)
+
+        player_big_hit   = detect_player_big_hit(orders_a, orders_b, self.metrics, self.p)
+
+        # volume: use a função simplificada que você adotou (instante + média do evento)
+        vol_spike_hit    = detect_vol_spike_two_conditions(
+            vol_inst=vol_comb,
+            vol_cum=self.evt["vol"],                 # passe o evento para olhar média do evento (evt["vol"]/evt["dur"])
+            metrics=self.metrics,
+            params=self.p,
+        )
+
+        # range dinâmico (usa range do evento e duração)
+        range_cut        = detect_range_hit(
+            range=self.evt["range"],
+            dur=self.evt["dur"],
+            metrics=self.metrics,
+            params=self.p,
+        )
+
+        # speed (janela curta dentro do evento vs baseline 5m)
+        speed_price_cut  = detect_speed_hit(self.metrics, self.evt, self.p, min_a, max_a, self.last_close_a)
+
+        # order rate: segundo atual OU taxa média do evento
+        order_rate_cut   = detect_order_rate_cut_simple(self.metrics, self.evt, n_orders, self.p)
+
         cause_flags = {
             "inversion": inv_hit,
-            "player": player_big_hit,
-            "vol": vol_spike_hit,
-            "range": range_cut,
-            "speed": speed_price_cut,
-            "rate": order_rate_cut,
-            "time": end_by_time_pre,
+            "player":    player_big_hit,
+            "vol":       vol_spike_hit,
+            "range":     range_cut,
+            "speed":     speed_price_cut,
+            "rate":      order_rate_cut,
+            "time":      end_by_time_pre,
         }
         cause_order = ["inversion", "player", "vol", "range", "speed", "rate", "time"]
-        cause = next((c for c in cause_order if cause_flags[c]), None)
-        boundary_now = (cooldown_ok or end_by_time_pre) and (cause is not None)
-        if boundary_now:
-            # Close previous event at s-1
-            self.evt["end"] = s - 1
-            self.evt["dur"] = self.evt["end"] - self.evt["start"] + 1
-            self.evt["end_reason"] = "time_pre" if cause == "time" else cause
-            # Final metrics at event end
-            def _mv(p0: Optional[float], p1: Optional[float], tk: float) -> float:
-                if p0 is None or p1 is None or tk <= 0:
-                    return 0.0
-                return abs((p1 - p0) / tk)
-            self.evt["d_ticks_max"] = max(
-                _mv(self.evt["p0_a"], self.evt["plast_a"], self.p.tick_a),
-                _mv(self.evt["p0_b"], self.evt["plast_b"], self.p.tick_b),
-            )
-            self.evt["range_ticks"] = max(
-                (self.evt["pmax_a"] - self.evt["pmin_a"]) / max(self.p.tick_a, 1e-9) if self.evt["pmin_a"] is not None else 0.0,
-                (self.evt["pmax_b"] - self.evt["pmin_b"]) / max(self.p.tick_b, 1e-9) if self.evt["pmin_b"] is not None else 0.0,
-            )
-            self.evt["ticks_per_s"] = self.evt["d_ticks_max"] / max(self.evt["dur"], 1)
+
+        # --- decidir fechamento ---
+        end_causes = pick_end_causes(cause_flags, cause_order)
+        has_cut = bool(end_causes)
+
+        # Se acendeu corte e ainda não há "graça" pendente, agenda encerrar em s + end_grace_s
+        if has_cut and not self.evt.get("grace_pending", False):
+            self.evt["grace_pending"] = True
+            self.evt["grace_until"]   = int(s) + int(getattr(self.p, "end_grace_s", 1))
+            self.evt["end_primary"]   = end_causes[0]  # se quiser registrar a principal
+            push_end_reasons(self.evt, end_causes)     # salva TODAS as flags ativas no s do corte
+
+        # Se já está em "graça" e chegamos no segundo-agendado, FINALIZA agora (após acumular s)
+        finalize_now = bool(self.evt.get("grace_pending")) and (int(s) >= int(self.evt.get("grace_until", s+1)))
+
+        if finalize_now:
+            # Também registra flags que permaneceram ativas no segundo de encerramento
+            if has_cut:
+                push_end_reasons(self.evt, end_causes)
+
+            # finalizar/enriquecer + emitir
             self.evt = finalize_event_enrichment(
-                self.evt, self.p, self.metrics, self.p.tick_a, self.p.tick_b, utils.extrair_preco
+                self.evt, self.p, self.metrics, self.p.tick_a, self.p.tick_b, extrair_preco
             )
             events_out.append(self.evt)
-            self.last_event_end = self.evt["end"]
-            self.last_boundary_at = s
-            # Start new event at s
+
+            # abrir novo evento imediatamente no mesmo segundo (se houver atividade)
             self.evt = {
                 "start": s,
                 "end": s,
                 "dur": 1,
-                "p0_a": smry_a["open"] if smry_a["open"] is not None else close_a,
-                "p0_b": smry_b["open"] if smry_b["open"] is not None else close_b,
-                "pmin_a": smry_a["pmin"] if smry_a["pmin"] is not None else close_a,
-                "pmax_a": smry_a["pmax"] if smry_a["pmax"] is not None else close_a,
-                "pmin_b": smry_b["pmin"] if smry_b["pmin"] is not None else close_b,
-                "pmax_b": smry_b["pmax"] if smry_b["pmax"] is not None else close_b,
-                "plast_a": close_a,
-                "plast_b": close_b,
-                "vol": vol_comb,
-                "n_trades": smry_a["n"] + smry_b["n"],
-                "ema_vol_start": self.metrics.ema_vol_sec,
-                "ema_var5m_start_ticks": ema_var5m_ticks,
-                "start_reason": cause or "boundary",
-                "start_flags": cause_flags,
+                "open": close_a,
+                "min": close_a,
+                "max": close_a,
+                "close": close_a,
+                "vol": 0.0,
+                "n_trades": 0.0,
+                "range": 0.0,
+                "tt_a": [],
+                "tt_b": [],
+                "end_reason": [],
             }
             self.evt["acc"] = event_acc_init()
-            # Reset streaks
-            self.speed_price_streak = 0
-            self.rate_hi_streak = 0
-        else:
-            # Continue current event
-            self.evt["end"] = s
-            self.evt["dur"] = self.evt["end"] - self.evt["start"] + 1
-            if smry_a["pmin"] is not None:
-                self.evt["pmin_a"] = min(self.evt["pmin_a"], smry_a["pmin"])
-                self.evt["pmax_a"] = max(self.evt["pmax_a"], smry_a["pmax"])
-                if close_a is not None:
-                    self.evt["plast_a"] = close_a
-            if smry_b["pmin"] is not None:
-                self.evt["pmin_b"] = min(self.evt["pmin_b"], smry_b["pmin"])
-                self.evt["pmax_b"] = max(self.evt["pmax_b"], smry_b["pmax"])
-                if close_b is not None:
-                    self.evt["plast_b"] = close_b
-            self.evt["vol"] += vol_comb
-            self.evt["n_trades"] += (smry_a["n"] + smry_b["n"])
-            event_accumulate_second(
-                self.evt["acc"],
-                trades_a,
-                trades_b,
-                smry_a,
-                smry_b,
-                close_a,
-                close_b,
-                self.last_close_a,
-                self.last_close_b,
-                self.p.tick_a,
-                self.p.tick_b,
-                starts_a,
-                starts_b,
-                self.p,
-            )
-        # Update last closes
+            self.evt.setdefault("speed_win_s", int(self.p.speed_win_s))
+
+        # --- atualizar últimos closes e sair ---
         self.last_close_a, self.last_close_b = close_a, close_b
         return events_out

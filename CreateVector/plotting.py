@@ -1,252 +1,171 @@
-"""
-Plotting utilities for inspecting event segmentation results.
-
-This module groups together plotting functions that generate various
-visualisations from event DataFrames. These functions are intended to
-be called interactively by users to explore the distribution of event
-metrics, relationships between variables, and the distribution of
-events across time of day and trigger types. Additional helper
-functions facilitate plotting tick‑by‑tick price series coloured by
-event ID.
-"""
-
-from __future__ import annotations
-
 from typing import Dict, Tuple, List, Iterable, Optional, Any
 import matplotlib.pyplot as plt
-import numpy as np
-from collections import Counter
-import pandas as pd
 from datetime import datetime, timezone
 import matplotlib.dates as mdates
+from collections import Counter, defaultdict
+from datetime import datetime
+import math
+from matplotlib.cm import get_cmap
+from zoneinfo import ZoneInfo  # py>=3.9
 
-__all__ = [
-    "plot_event_distributions",
-    "plot_relationships",
-    "plot_counts_by_hour_and_reason",
-    "print_top_outliers",
-    "plot_tick_series",
-]
+def _as_list_flags(x):
+    if x is None:
+        return []
+    if isinstance(x, (list, tuple)):
+        return list(x)
+    # se for string única, vira lista
+    return [x]
 
+def _primary_reason(ev):
+    # se você estiver salvando 'end_primary', respeita; senão, 1º da lista
+    if "end_primary" in ev and ev["end_primary"]:
+        return ev["end_primary"]
+    flags = _as_list_flags(ev.get("end_reason"))
+    return flags[0] if flags else None
 
-def plot_event_distributions(df: pd.DataFrame) -> None:
-    """Plot histograms and ECDFs of basic event metrics.
+def _percentiles(vals, ps=(0, 25, 50, 75, 90, 95, 99, 100)):
+    if not vals:
+        return {p: 0 for p in ps}
+    xs = sorted(vals)
+    res = {}
+    for p in ps:
+        if p <= 0:   res[p] = xs[0]
+        elif p >= 100: res[p] = xs[-1]
+        else:
+            k = (len(xs)-1) * (p/100.0)
+            f = math.floor(k)
+            c = math.ceil(k)
+            if f == c:
+                res[p] = xs[int(k)]
+            else:
+                res[p] = xs[f] + (xs[c]-xs[f]) * (k - f)
+    return res
 
-    Generates a series of plots summarising the distribution of event
-    durations, volumes, ranges and speeds. If the DataFrame is empty
-    the function prints a message and returns.
-    """
-    if df.empty:
-        print("Sem eventos no DataFrame.")
+def print_event_stats(eventos):
+    total = len(eventos)
+    if total == 0:
+        print("Sem eventos.")
         return
-    # Duration histogram
-    plt.figure(figsize=(10, 4))
-    vals = df["dur_s"].dropna()
-    bins = np.arange(1, max(60, int(vals.max()) + 2))
-    plt.hist(vals, bins=bins, edgecolor="none")
-    plt.title("Eventos — Duração (s)")
-    plt.xlabel("segundos")
-    plt.ylabel("contagem")
-    plt.tight_layout()
-    plt.show()
-    # Volume histogram (log)
-    if "vol" in df and df["vol"].notna().any():
-        v = df["vol"].dropna()
-        v = v[v > 0]
-        if len(v) > 0:
-            nb = 40
-            vmin, vmax = max(1.0, v.min()), v.max()
-            bins = np.logspace(np.log10(vmin), np.log10(vmax + 1e-9), nb)
-            plt.figure(figsize=(10, 4))
-            plt.hist(v, bins=bins)
-            plt.xscale("log")
-            plt.title("Eventos — Volume ponderado (log)")
-            plt.xlabel("volume")
-            plt.ylabel("contagem")
-            plt.tight_layout()
-            plt.show()
-    # Range histogram
-    if "range_ticks" in df:
-        plt.figure(figsize=(10, 4))
-        plt.hist(df["range_ticks"].dropna(), bins=50)
-        plt.title("Eventos — Range (ticks)")
-        plt.xlabel("ticks")
-        plt.ylabel("contagem")
-        plt.tight_layout()
-        plt.show()
-    # Speed histogram
-    if "ticks_per_s" in df:
-        plt.figure(figsize=(10, 4))
-        plt.hist(df["ticks_per_s"].dropna(), bins=50)
-        plt.title("Eventos — Velocidade média (ticks/s)")
-        plt.xlabel("ticks/s")
-        plt.ylabel("contagem")
-        plt.tight_layout()
-        plt.show()
-    # ECDF helper
-    def _plot_ecdf(series: pd.Series, title: str, xlabel: str) -> None:
-        x = np.sort(series.dropna().values)
-        if len(x) == 0:
-            return
-        y = np.arange(1, len(x) + 1) / len(x)
-        plt.figure(figsize=(8, 4))
-        plt.plot(x, y, drawstyle="steps-post")
-        plt.title(title)
-        plt.xlabel(xlabel)
-        plt.ylabel("ECDF")
-        plt.tight_layout()
-        plt.show()
-    _plot_ecdf(df["dur_s"], "ECDF — Duração", "segundos")
-    if "vol" in df:
-        # Add small constant to avoid log10 of zero
-        _plot_ecdf(np.log10(df["vol"].replace(0, np.nan)), "ECDF — log10(Volume)", "log10(volume)")
-    if "range_ticks" in df:
-        _plot_ecdf(df["range_ticks"], "ECDF — Range (ticks)", "ticks")
+
+    # ===== 1) Causa primária (end_reason[0] ou end_primary) =====
+    prim = [_primary_reason(ev) for ev in eventos]
+    reason_cnt = Counter(prim)
+    print("\n== Causa primária do encerramento ==")
+    for k, c in reason_cnt.most_common():
+        pct = 100.0 * c / total
+        print(f"{(k or 'unknown'):>10}: {c:5d}  ({pct:5.1f}%)")
+
+    # ===== 2) Frequência de TODAS as flags ativas no fechamento =====
+    all_flags = []
+    for ev in eventos:
+        all_flags.extend(_as_list_flags(ev.get("end_reason")))
+    flag_cnt = Counter(all_flags)
+    print("\n== Flags ativas no encerramento (todas) ==")
+    for k, c in flag_cnt.most_common():
+        pct = 100.0 * c / total
+        print(f"{k:>10}: {c:5d}  ({pct:5.1f}%)")
+
+    # ===== 3) Eventos por hora =====
+    per_hour = Counter()
+    for ev in eventos:
+        try:
+            h = datetime.fromtimestamp(int(ev["start"])).hour
+        except Exception:
+            # fallback: se 'start' não for epoch, tenta usar modulo 24
+            h = int(ev.get("start", 0)) % 24
+        per_hour[h] += 1
+
+    print("\n== Eventos por hora ==")
+    for h in sorted(per_hour):
+        c = per_hour[h]; pct = 100.0 * c / total
+        print(f"{h:02d}h: {c:5d}  ({pct:5.1f}%)")
+
+    # ===== 4) Duração dos eventos (segundos) =====
+    durs = [int(ev.get("dur", 0)) for ev in eventos]
+    P = _percentiles(durs)
+    mean = sum(durs)/total if total else 0
+    print("\n== Duração dos eventos (s) ==")
+    print(f"n={total}  mean={mean:0.1f}  min={P[0]:.0f}  p25={P[25]:.0f}  p50={P[50]:.0f}  "
+          f"p75={P[75]:.0f}  p90={P[90]:.0f}  p95={P[95]:.0f}  p99={P[99]:.0f}  max={P[100]:.0f}")
+
+    # ===== 5) Duração por causa primária =====
+    durs_by_cause = defaultdict(list)
+    for ev in eventos:
+        durs_by_cause[_primary_reason(ev)].append(int(ev.get("dur", 0)))
+
+    print("\n== Duração por causa primária (p50 / p75 / p90) ==")
+    for cause, lst in sorted(durs_by_cause.items(), key=lambda kv: (kv[0] is None, str(kv[0]))):
+        if not lst:
+            continue
+        P = _percentiles(lst, ps=(50, 75, 90))
+        print(f"{(cause or 'unknown'):>10}:  p50={P[50]:.0f}s  p75={P[75]:.0f}s  p90={P[90]:.0f}s")
+
+    # ===== 6) (Opcional) Combos de flags no encerramento =====
+    combos = Counter(tuple(sorted(set(_as_list_flags(ev.get("end_reason"))))) for ev in eventos)
+    print("\n== Combos de flags no encerramento (top 10) ==")
+    for combo, c in combos.most_common(10):
+        tag = ",".join(combo) if combo else "none"
+        pct = 100.0 * c / total
+        print(f"{tag:>30}: {c:5d}  ({pct:5.1f}%)")
 
 
-def plot_relationships(df: pd.DataFrame) -> None:
-    """Plot relationships between selected event metrics.
-
-    Generates hexbin plots for volume vs range and volume vs speed. Also
-    produces boxplots of key metrics grouped by the reason for event
-    termination. If the DataFrame is empty the function returns.
-    """
-    if df.empty:
-        return
-    if {"vol", "range_ticks"}.issubset(df.columns):
-        plt.figure(figsize=(6, 5))
-        plt.hexbin(df["vol"], df["range_ticks"], gridsize=40, mincnt=1)
-        plt.xscale("log")
-        plt.title("Hexbin — Volume vs Range (ticks)")
-        plt.xlabel("volume (log)")
-        plt.ylabel("range (ticks)")
-        plt.tight_layout()
-        plt.show()
-    if {"vol", "ticks_per_s"}.issubset(df.columns):
-        plt.figure(figsize=(6, 5))
-        plt.hexbin(df["vol"], df["ticks_per_s"], gridsize=40, mincnt=1)
-        plt.xscale("log")
-        plt.title("Hexbin — Volume vs Velocidade (ticks/s)")
-        plt.xlabel("volume (log)")
-        plt.ylabel("ticks/s")
-        plt.tight_layout()
-        plt.show()
-    if "end_reason" in df.columns:
-        for metric in ["dur_s", "vol", "range_ticks", "ticks_per_s", "n_trades"]:
-            if metric in df.columns:
-                sub = df[["end_reason", metric]].dropna()
-                if sub.empty:
-                    continue
-                groups = [g[metric].values for _, g in sub.groupby("end_reason")]
-                labels = [str(k) for k, _ in sub.groupby("end_reason")]
-                plt.figure(figsize=(10, 4))
-                plt.boxplot(groups, labels=labels, showfliers=False)
-                plt.title(f"Boxplot — {metric} por end_reason")
-                plt.xlabel("end_reason")
-                plt.ylabel(metric)
-                plt.tight_layout()
-                plt.show()
+    # ================== PLOT TICK-A-TICK (tempo real no eixo X) ==================
 
 
-def plot_counts_by_hour_and_reason(df: pd.DataFrame) -> None:
-    """Plot counts of events by hour of day and termination reason."""
-    if df.empty or "hour" not in df.columns:
-        return
-    per_hour = df.groupby("hour").size().reindex(range(0, 24), fill_value=0)
-    plt.figure(figsize=(10, 3))
-    plt.bar(per_hour.index, per_hour.values)
-    plt.title("Eventos por hora")
-    plt.xlabel("hora")
-    plt.ylabel("contagem")
-    plt.tight_layout()
-    plt.show()
-    if "end_reason" in df.columns:
-        pivot = df.pivot_table(index="hour", columns="end_reason", values="start_ts", aggfunc="count").fillna(0).reindex(range(0, 24), fill_value=0)
-        pivot.plot(kind="bar", stacked=True, figsize=(12, 4))
-        plt.title("Eventos por hora (stacked por end_reason)")
-        plt.xlabel("hora")
-        plt.ylabel("contagem")
-        plt.tight_layout()
-        plt.show()
-        cnt = df["end_reason"].value_counts()
-        plt.figure(figsize=(8, 3))
-        plt.bar(cnt.index.astype(str), cnt.values)
-        plt.title("Eventos por end_reason")
-        plt.xlabel("end_reason")
-        plt.ylabel("contagem")
-        plt.tight_layout()
-        plt.show()
+LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
 
-
-def print_top_outliers(df: pd.DataFrame, top: int = 10) -> None:
-    """Print tables of the top events by selected metrics."""
-    def _show(title: str, ser: pd.Series) -> None:
-        print(f"\n== Top {top} por {title} ==")
-        if ser.empty:
-            print("(vazio)")
-            return
-        idx = ser.sort_values(ascending=False).head(top).index
-        cols = [
-            "start_time",
-            "end_time",
-            "dur_s",
-            "end_reason",
-            "vol",
-            "range_ticks",
-            "ticks_per_s",
-            "n_trades",
-            "p0_a",
-            "plast_a",
-            "pmin_a",
-            "pmax_a",
-        ]
-        cols = [c for c in cols if c in df.columns]
-        print(df.loc[idx, cols].to_string(index=False))
-    if "range_ticks" in df:
-        _show("range_ticks", df["range_ticks"].dropna())
-    if "vol" in df:
-        _show("volume", df["vol"].dropna())
-    if "ticks_per_s" in df:
-        _show("ticks_per_s", df["ticks_per_s"].dropna())
-    if "n_trades" in df:
-        _show("n_trades", df["n_trades"].dropna())
-
-
-def _build_event_sec_map(eventos_list: List[Dict[str, Any]]) -> Dict[int, int]:
-    """Map each second to an event index."""
-    evmap: Dict[int, int] = {}
+def _build_event_sec_map(eventos_list):
+    """sec -> id_evento; fora de evento = -1."""
+    evmap = {}
     for k, ev in enumerate(eventos_list):
-        for s in range(int(ev["start"]), int(ev["end"]) + 1):
+        s0 = int(ev["start"]); s1 = int(ev["end"])
+        for s in range(s0, s1 + 1):
             evmap[s] = k
     return evmap
 
-
-def _tick_series_time(sec_map: Dict[int, List[List[float]]], evmap: Dict[int, int]) -> Tuple[List[datetime], List[float], List[int]]:
-    """Build time series (datetime, price, event ID) for tick‑by‑tick plotting."""
-    xs_time: List[datetime] = []
-    ys: List[float] = []
-    ev_ids: List[int] = []
+def _tick_series_time(sec_map, evmap):
+    """
+    Constrói série tick-a-tick:
+    xs_time: datetimes (espalhando trades dentro do segundo)
+    ys: preços
+    ev_ids: id do evento (ou -1)
+    sec_map: dict[int -> list[trade]], trade[0] = price
+    """
+    xs_time, ys, ev_ids = [], [], []
     for s in sorted(sec_map.keys()):
         trades = sec_map[s]
         n = len(trades)
         if n == 0:
             continue
+        # espalha no intervalo [s, s+1) p/ preservar ordem intrassegundo
         for k, tr in enumerate(trades):
-            frac = (k + 1) / (n + 1)
+            frac = (k + 1) / (n + 1)    # 0<frac<1
             t_real = s + frac
+            # epoch segundos -> timezone local
             dt_utc = datetime.fromtimestamp(t_real, tz=timezone.utc)
-            xs_time.append(dt_utc)
+            dt_loc = dt_utc.astimezone(LOCAL_TZ)
+            xs_time.append(dt_loc)
             ys.append(float(tr[0]))
             ev_ids.append(evmap.get(s, -1))
     return xs_time, ys, ev_ids
 
+def _choose_color(eid, base_cmap, n_colors=20):
+    """Cores estáveis por evento; -1 (fora) fica cinza."""
+    if eid < 0:
+        return (0.6, 0.6, 0.6, 0.8)  # cinza
+    # usa tab20 como paleta base e cicla
+    idx = eid % n_colors
+    return base_cmap(idx / max(1, n_colors - 1))
 
-def _plot_segments_time(xs: List[datetime], ys: List[float], ev_ids: List[int], title: str) -> None:
-    """Plot tick‑by‑tick price series coloured by event ID."""
+def _plot_segments_time(xs, ys, ev_ids, eventos=None,
+                        title="Tick-a-tick — cores por evento (tempo real)",
+                        shade_events=True):
     if not xs:
         print("Sem dados para plot.")
         return
-    segments: List[Tuple[List[datetime], List[float], int]] = []
+
+    # quebra em segmentos contíguos de mesmo evento (para desenhar com 1 cor cada bloco)
+    segments = []
     start = 0
     last = ev_ids[0]
     for i in range(1, len(xs)):
@@ -255,78 +174,124 @@ def _plot_segments_time(xs: List[datetime], ys: List[float], ev_ids: List[int], 
             start = i
             last = ev_ids[i]
     segments.append((xs[start:], ys[start:], last))
+
     fig, ax = plt.subplots(figsize=(14, 5))
-    for sx, sy, _eid in segments:
-        ax.plot(sx, sy, linewidth=0.8)
+
+    # sombreia janelas dos eventos (opcional)
+    if shade_events and eventos:
+        for k, ev in enumerate(eventos):
+            t0 = datetime.fromtimestamp(int(ev["start"]), tz=timezone.utc).astimezone(LOCAL_TZ)
+            t1 = datetime.fromtimestamp(int(ev["end"]) + 1, tz=timezone.utc).astimezone(LOCAL_TZ)
+            ax.axvspan(t0, t1, color=_choose_color(k, get_cmap("tab20")), alpha=0.08, lw=0)
+
+    cmap = get_cmap("tab20")
+    for sx, sy, eid in segments:
+        ax.plot(sx, sy, linewidth=0.9, color=_choose_color(eid, cmap))
+
     ax.set_title(title)
-    ax.set_xlabel("tempo")
+    ax.set_xlabel("tempo (America/Sao_Paulo)")
     ax.set_ylabel("preço")
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
-    fig.autofmt_xdate()
-    plt.tight_layout()
+
+    # formato de datas bonitinho
+    loc = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(loc)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
     plt.show()
 
+def print_event(ev, label="A", columns=4, colw=24, line_width=100):
+    """
+    Imprime SOMENTE o conteúdo de ev["vector"] em colunas alinhadas.
+    columns: nº de colunas por linha
+    colw:    largura de cada coluna
+    """
 
-def plot_tick_series(
-    sec_price: Dict[int, List[List[float]]],
-    eventos: List[Dict[str, Any]],
-    title: Optional[str] = None,
-    symbol_label: Optional[str] = None,
-) -> None:
-    """High‑level helper to plot tick‑by‑tick price series coloured by events."""
-    evmap = _build_event_sec_map(eventos)
-    xs_time, ys_price, ev_ids = _tick_series_time(sec_price, evmap)
-    label = symbol_label or "Preço"
-    ttl = title or f"Tick-a-tick — {label} por evento"
-    _plot_segments_time(xs_time, ys_price, ev_ids, ttl)
-
-
-def print_event(ev, tick_a=0.5, tick_b=0.5, label_a="A", label_b="B"):
     import datetime as dt
+    import textwrap as tw
 
-    def ts(x): 
-        return dt.datetime.fromtimestamp(int(x)).strftime("%H:%M:%S")
+    vec = ev.get("vector", None)
+    if not isinstance(vec, dict) or not vec:
+        print("══════════════════════════════════════════════════════════════════")
+        print(f"[EVENT {label}] (sem vetor)")
+        print("══════════════════════════════════════════════════════════════════\n")
+        return
 
-    def nz(x, d=None):
-        return d if (x is None) else x
+    # ---------- helpers ----------
+    def hbar(ch="═", w=None):
+        w = w or line_width
+        return ch * max(20, w)
 
-    # campos básicos
-    flags = ev.get("start_flags", {})
-    on = [k for k, v in flags.items() if v]
-    mv  = float(ev.get("d_ticks_max", 0.0))
-    rng = float(ev.get("range_ticks", 0.0))
-    dur = int(ev.get("dur", 0))
-    spd = float(ev.get("ticks_per_s", mv / max(1, dur)))  # fallback
+    def fmt(x, nd=2):
+        try:
+            if x is None:
+                return "-"
+            # trata ints explicitamente
+            if isinstance(x, int):
+                return f"{x:d}"
+            return f"{float(x):.{nd}f}"
+        except Exception:
+            return "-"
 
-    # preços por símbolo
-    p0a = ev.get("p0_a"); pla = ev.get("plast_a")
-    p0b = ev.get("p0_b"); plb = ev.get("plast_b")
-    pmina = ev.get("pmin_a"); pmaxa = ev.get("pmax_a")
-    pminb = ev.get("pmin_b"); pmaxb = ev.get("pmax_b")
+    def decimals_for(key, val):
+        """Precisão por campo (default=2)."""
+        int_keys = {"dt", "g_b", "g_s", "g_n", "max_streak_buy", "max_streak_sell",
+                    "b_vol", "s_vol", "t_vol", "d_vol"}
+        pctx_keys = {"pctx0", "pctx1", "pctx2", "pctx3", "pctx4"}
+        three_dec = {"efrang"}
+        if key in int_keys or isinstance(val, int):
+            return 0
+        if key in pctx_keys:
+            return 2
+        if key in three_dec:
+            return 3
+        # default
+        return 2
 
-    # deslocamento e range em ticks por símbolo (com fallback seguro)
-    def ticks_move(p0, p1, tk):
-        if p0 is None or p1 is None or tk <= 0: 
-            return 0.0
-        return (float(p1) - float(p0)) / float(tk)
+    def rowize(pairs, ncols=columns, width=colw):
+        """Lista de (k, v) -> linhas com n colunas fixas, separadas por ' | '."""
+        cells = [f"{k}: {v}" for k, v in pairs]
+        lines = []
+        for i in range(0, len(cells), ncols):
+            chunk = cells[i:i+ncols]
+            padded = []
+            for c in chunk:
+                if len(c) > width:
+                    c = tw.shorten(c, width=width, placeholder="…")
+                padded.append(f"{c:<{width}}")
+            lines.append(" | ".join(padded).rstrip())
+        return lines
 
-    def ticks_range(pmin, pmax, tk):
-        if pmin is None or pmax is None or tk <= 0:
-            return 0.0
-        return (float(pmax) - float(pmin)) / float(tk)
+    # ---------- ordem desejada dos campos ----------
+    order = [
+        "dt",
+        "dp", "dmx", "dmm", "dmt", "dmv",
+        "dvwap", "ddayo", "d5m", "d30m", "efrang",
+        "pctx0", "pctx1", "pctx2", "pctx3", "pctx4",
+        "b_vol", "s_vol", "t_vol", "d_vol", "avg_vol",
+        "g_b", "g_s", "g_n", "rate_avg",
+        "max_streak_buy", "max_streak_sell",
+        "ema_vol_total", "ema_order_rate",
+    ]
 
-    mv_a_t = ticks_move(p0a, pla, tick_a)
-    mv_b_t = ticks_move(p0b, plb, tick_b)
-    rg_a_t = ticks_range(pmina, pmaxa, tick_a)
-    rg_b_t = ticks_range(pminb, pmaxb, tick_b)
+    # mantém apenas chaves existentes em vec e no order
+    keys = [k for k in order if k in vec]
 
-    # prints
-    print(
-        f"[EVENT] {ts(ev['start'])}→{ts(ev['end'])} dur={dur:2d}s "
-        f"start={ev.get('start_reason','?'):>9} end={ev.get('end_reason','?'):>7} "
-        f"flags={on} vol={int(ev.get('vol',0))} n={int(ev.get('n_trades',0))} "
-        f"mv={mv:+.1f}t range={rng:.1f}t speed={spd:.2f}t/s | "
-        f"{label_a}: p0={nz(p0a,'-')} pf={nz(pla,'-')} d={mv_a_t:+.1f}t R={rg_a_t:.1f}t | "
-        f"{label_b}: p0={nz(p0b,'-')} pf={nz(plb,'-')} d={mv_b_t:+.1f}t R={rg_b_t:.1f}t"
-    )
+    # monta pares já formatados
+    pairs = []
+    for k in keys:
+        nd = decimals_for(k, vec[k])
+        pairs.append((k, fmt(vec[k], nd)))
+
+    # ---------- impressão ----------
+    print(hbar("═", line_width))
+    print(f"[EVENT {label}]  VECTOR")
+    print(hbar("─", line_width))
+
+    for line in rowize(pairs, ncols=columns, width=colw):
+        print(line)
+
+    print(hbar("═", line_width))
+    print("")  # espaço entre eventos
+

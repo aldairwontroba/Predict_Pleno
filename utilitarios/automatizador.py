@@ -12,8 +12,8 @@ import sys
 from zipfile import ZipFile, ZIP_DEFLATED
 
 # ================== CONFIG GERAL ==================
-YEAR = 2018
-MARKET_PAIR = "INDWIN"   # "DOLWDO" ou "WININD"
+YEAR = 2025
+MARKET_PAIR = "DOLWDO"   # "DOLWDO" ou "WININD"
 SAVE_AND_ZIP_DAT = False  # True = copiar e compactar .dat | False = não salvar .dat
 
 # Mapeia nomes de pastas e símbolos aceitos por par de mercado
@@ -64,7 +64,7 @@ LIST_CLICK_POS = (2787, 121)                # ponto dentro da lista (x,y)
 N_ITENS_PARA_SUBIR = 1                      # geralmente 1 (arquivo logo acima)
 ESPERA_REPLAY_INICIAR = 20                  # segundos até mandar Enter no pop-up
 FATOR_SCROLL = 0                            # 0 = não rola
-REPETICOES = 150                            # quantos arquivos processar
+REPETICOES = 200                            # quantos arquivos processar
 
 gui.FAILSAFE = True     # mover mouse p/ canto sup-esq aborta
 gui.PAUSE = 0.15        # intervalo entre ações
@@ -263,7 +263,7 @@ def main():
 
         # 2) Espera iniciar e fecha pop-up com Enter
         time.sleep(ESPERA_REPLAY_INICIAR)
-        enviar_enter_para_popup()
+        # enviar_enter_para_popup()
 
         # 3) Executa sua rotina
         minha_funcao_de_processamento()

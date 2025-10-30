@@ -6,13 +6,13 @@ import pandas as pd
 
 ROOT = Path(r"E:\Mercado BMF&BOVESPA\tryd")   # raiz dos dados
 OUT  = ROOT / "consolidados_npz"              # pasta de saída
-YEARS = range(2018, 2025)
+YEARS = range(2025, 2026)
 
-start_date = "20180329"
+start_date = "20250801"
 
 # regex para identificar arquivos (aceita dol/wdo com sufixo extra)
-# FILE_RE = re.compile(r"(?P<date>\d{8})_(?P<ativo>dol|wdo)", re.IGNORECASE)
-FILE_RE = re.compile(r"(?P<date>\d{8})_(?P<ativo>ind|win)", re.IGNORECASE)
+FILE_RE = re.compile(r"(?P<date>\d{8})_(?P<ativo>dol|wdo)", re.IGNORECASE)
+# FILE_RE = re.compile(r"(?P<date>\d{8})_(?P<ativo>ind|win)", re.IGNORECASE)
 FOLDER_RE = re.compile(r"^(?P<y>\d{4})-?(?P<m>\d{2})-?(?P<d>\d{2})$")
 
 def parse_folder_date(name: str) -> str | None:
@@ -61,8 +61,8 @@ def salvar_por_dia():
     total = 0
 
     for year in YEARS:
-        # year_dir = ROOT / str(year) / "Extraidos DOLWDO"
-        year_dir = ROOT / str(year) / "Extraidos INDWIN"
+        year_dir = ROOT / str(year) / "Extraidos DOLWDO"
+        # year_dir = ROOT / str(year) / "Extraidos INDWIN"
         if not year_dir.is_dir():
             continue
 

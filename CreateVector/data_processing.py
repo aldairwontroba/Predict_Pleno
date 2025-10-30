@@ -1,28 +1,10 @@
-from __future__ import annotations
-
 import re
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional, Iterable, Any
 import numpy as np
-import pandas as pd
-import math
 
 from segmentation import EventSegmenter, SegParams
-import utils
-
-__all__ = [
-    "lot_multiplier",
-    "find_files_for_day",
-    "load_npz",
-    "to_epoch_seconds",
-    "group_by_second_preserving_order",
-    "process_day",
-    "events_to_df",
-    "expand_list_columns",
-    "build_feature_df",
-    "normalize_events_to_vectors",
-]
-
+from plotting import print_event
 
 def lot_multiplier(sym: str) -> float:
     """Return the lot multiplier for a given symbol.
@@ -31,7 +13,6 @@ def lot_multiplier(sym: str) -> float:
     WDO/WIN have a multiplier of 1. The symbol string is case‑insensitive.
     """
     return 5.0 if sym.lower() in ("dol", "ind") else 1.0
-
 
 def find_files_for_day(data_dir: Path, day: str, pair: Tuple[str, str]) -> Dict[str, Path]:
     """Locate NPZ files for the requested trading day and symbol pair.
@@ -114,6 +95,7 @@ def process_day(
     day: str,
     pair: Tuple[str, str],
     params: Optional[SegParams] = None,
+    imprimir=False
 ) -> List[Dict[str, Any]]:
     """Load and process a day's trading data into events.
 
@@ -133,24 +115,25 @@ def process_day(
     sec_a = group_by_second_preserving_order(to_epoch_seconds(t_a), TT_a, sym_a)
     sec_b = group_by_second_preserving_order(to_epoch_seconds(t_b), TT_b, sym_b)
     secs = sorted(set(sec_a.keys()) | set(sec_b.keys()))
-    tick_size_map = {"wdo": 0.5, "dol": 0.5, "win": 5.0, "ind": 5.0}
-    tick_a = tick_size_map.get(sym_a, 0.5)
-    tick_b = tick_size_map.get(sym_b, 0.5)
-    p = params or SegParams(
-        tick_a=tick_a,
-        tick_b=tick_b,
-        lot_mult_a=lot_multiplier(sym_a),
-        lot_mult_b=lot_multiplier(sym_b),
-    )
-    seg = EventSegmenter(p)
+
+    if sym_a.lower() in ("wdo", "dol"):
+        params = SegParams()  # padrão genérico
+    elif sym_a.lower() in ("win", "ind"):
+        params = SegParams.for_indice()
+        
+    seg = EventSegmenter(params)
     seg.reset()
     eventos: List[Dict[str, Any]] = []
     for s in secs:
         trades_a = sec_a.get(s, [])
         trades_b = sec_b.get(s, [])
-        eventos.extend(seg.step(s, trades_a, trades_b))
+        events_done = seg.step(s, trades_a, trades_b)
+        eventos.extend(events_done)
+        if imprimir:
+            for ev in events_done:
+                print_event(ev)
     if seg.evt is not None:
         # Close the last event at end of day
         seg.evt["end_reason"] = "eod"
         eventos.append(seg.evt)
-    return eventos
+    return eventos, sec_a, sec_b
