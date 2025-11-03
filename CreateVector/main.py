@@ -1,5 +1,4 @@
-import argparse
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 import sys
 import numpy as np
 import os
@@ -11,15 +10,17 @@ if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 
 from segmentation import SegParams, EventSegmenter
-from data_processing import process_day
+from data_processing import process_day, find_files_for_pair
+from plotting import print_event_stats, print_event, _build_event_sec_map, _tick_series_time, _plot_segments_time
 
-from plotting import (
-    print_event_stats,
-    print_event,
-    _build_event_sec_map,
-    _tick_series_time,
-    _plot_segments_time,
-)
+def _process_one_day_worker(day_entry: Dict[str, Path], pair: Tuple[str, str], out_dir: Path) -> Tuple[str, int]:
+    """
+    Worker para executar um dia. Retorna (day_str, n_eventos).
+    `day_entry` é um dicionário como {"day": "YYYYMMDD", "wdo": Path(...), "dol": Path(...)}.
+    """
+    eventos, _, _ = process_day(out_dir, day_entry, pair, params=None, imprimir=False, save=True)
+    day_str = str(day_entry.get("day", ""))
+    return day_str, len(eventos)
 
 def realtime_process(pair: Tuple[str, str]):
     import ctypes
@@ -137,30 +138,65 @@ def realtime_process(pair: Tuple[str, str]):
         
         win32event.ResetEvent(event_handle)
 
-def process_all():
-    pass
+def process_all(data_dir, pair, startdate, enddate, out_dir, n_workers: int | None = None):
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import os as _os
+    from data_processing import find_files_for_pair
+
+    days = find_files_for_pair(data_dir, startdate, enddate, pair)  # List[Dict[str, Path]]
+    if not days:
+        print(f"[warn] nenhum arquivo no intervalo {startdate}..{enddate} para {pair}")
+        return
+
+    if n_workers is None or n_workers <= 0:
+        n_workers = max(1, (_os.cpu_count() or 1))
+
+    print(f"[info] processando {len(days)} dias com {n_workers} processos...")
+
+    # Importante no Windows: função worker precisa ser top-level (ver acima)
+    results = []
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        fut2day = {ex.submit(_process_one_day_worker, day_entry, pair, out_dir): day_entry["day"]
+                   for day_entry in days}
+        for fut in as_completed(fut2day):
+            day_str = fut2day[fut]
+            try:
+                day_done, n_events = fut.result()
+                print(f"[ok] {day_done}: {n_events} eventos")
+                results.append((day_done, n_events))
+            except Exception as exc:
+                print(f"[erro] dia {day_str}: {exc}")
+
+    return results
+
 
 if __name__ == "__main__":
     realtime = False
 
+    # Diretório onde ficam os .npz (ajuste conforme necessário). Em ambiente local
+    # definimos como o diretório atual para facilitar a execução.
     DATA_DIR  = Path(r"E:\Mercado BMF&BOVESPA\tryd\consolidados_npz")
-    DATA_DIR  = Path("./")
     DAY       = "20250912"
     PAIR      = ("wdo", "dol")   # ou 
     # PAIR      = ("win", "ind")   # ou 
+    out_dir = Path(r"E:\Mercado BMF&BOVESPA\tryd\eventos_processados")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ############################
+    # eventos, sec_a, sec_b = process_day(DATA_DIR, DAY, PAIR, imprimir=False)
+    # # imprime estatísticas resumidas dos eventos
+    # print_event_stats(eventos)
+    # sym_a, sym_b = PAIR[0].lower(), PAIR[1].lower()
+    # evmap = _build_event_sec_map(eventos)
+    # xs_time, ys_price, ev_ids = _tick_series_time(sec_a, evmap)
+    # _plot_segments_time(xs_time, ys_price, ev_ids, eventos=eventos,
+    #                     title=f"Tick-a-tick WDO — cores por evento (tempo real)")
+    ##########################
 
     if realtime:
         realtime_process(PAIR)
 
     else:
-        eventos, sec_a, sec_b = process_day(DATA_DIR, DAY, PAIR, imprimir=True)
-
-        print_event_stats(eventos)
-
-        sym_a, sym_b = PAIR[0].lower(), PAIR[1].lower()
-        evmap = _build_event_sec_map(eventos)
-        xs_time, ys_price, ev_ids = _tick_series_time(sec_a, evmap)
-        _plot_segments_time(xs_time, ys_price, ev_ids, eventos=eventos, title=f"Tick-a-tick WDO — cores por evento (tempo real)")
-
-
-        process_all()
+        startdate = "20180101"
+        enddate = "20251231"
+        process_all(DATA_DIR, PAIR, startdate, enddate, out_dir, n_workers=None) 

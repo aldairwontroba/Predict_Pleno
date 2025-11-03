@@ -7,60 +7,27 @@ from segmentation import EventSegmenter, SegParams
 from plotting import print_event
 
 def lot_multiplier(sym: str) -> float:
+    """Return the lot multiplier for a given symbol.
+
+    By convention DOL/IND contracts have a lot multiplier of 5, while
+    WDO/WIN have a multiplier of 1. The symbol string is case‑insensitive.
+    """
     return 5.0 if sym.lower() in ("dol", "ind") else 1.0
 
-def find_files_for_pair(
-    data_dir: Path,
-    startday: str,
-    endday: str,
-    pair: Tuple[str, str]
-) -> List[Dict[str, Path]]:
+def find_files_for_day(data_dir: Path, day: str, pair: Tuple[str, str]) -> Dict[str, Path]:
+    """Locate NPZ files for the requested trading day and symbol pair.
+
+    Filenames are expected to follow the pattern ``{day}_{symbol}.npz``.
+    Returns a dictionary mapping symbol names to their corresponding
+    ``Path`` objects. The keys are lower‑cased.
     """
-    Localiza todos os arquivos NPZ entre `startday` e `endday` para o par de símbolos informado.
-
-    Espera arquivos no formato: `YYYYMMDD_SYMBOL.npz`, todos no mesmo diretório (sem subpastas).
-
-    Retorna uma lista de dicionários:
-        [
-            {"day": "20250910", "wdo": Path("20250910_wdo.npz"), "dol": Path("20250910_dol.npz")},
-            {"day": "20250911", "wdo": Path("20250911_wdo.npz"), "dol": Path("20250911_dol.npz")},
-            ...
-        ]
-    """
-    start = int(startday)
-    end = int(endday)
-    sym_a, sym_b = pair[0].lower(), pair[1].lower()
-
-    # padrão: ex: 20250910_wdo.npz
-    pat = re.compile(r"^(\d{8})_([A-Za-z0-9]+)\.npz$", re.IGNORECASE)
-
-    # estrutura temporária: {day: {"day": day, "wdo": Path(...), "dol": Path(...)}}
-    by_day: Dict[str, Dict[str, Path]] = {}
-
+    pat = re.compile(rf"^({day})_({pair[0]}|{pair[1]})\.npz$", re.IGNORECASE)
+    out: Dict[str, Path] = {}
     for p in data_dir.glob("*.npz"):
         m = pat.match(p.name)
-        if not m:
-            continue
-
-        day_str, symbol = m.group(1), m.group(2).lower()
-        try:
-            day = int(day_str)
-        except ValueError:
-            continue
-
-        if not (start <= day <= end):
-            continue
-        if symbol not in (sym_a, sym_b):
-            continue
-
-        # adiciona no dicionário daquele dia
-        if day_str not in by_day:
-            by_day[day_str] = {"day": day_str}
-        by_day[day_str][symbol] = p
-
-    # ordena por data e retorna como lista
-    return [by_day[k] for k in sorted(by_day.keys())]
-
+        if m:
+            out[m.group(2).lower()] = p
+    return out
 
 def load_npz(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     """Load timestamp and trade arrays from an NPZ file.
@@ -123,34 +90,28 @@ def group_by_second_preserving_order(t_sec: np.ndarray, TT: np.ndarray, sym: str
         by_sec.setdefault(int(ts), []).append(r)
     return by_sec
 
-def _infer_day_str_from_paths(day: Dict[str, Path]) -> str:
-    """
-    Tenta extrair 'YYYYMMDD' do dict do dia. Se houver a chave 'day', usa ela.
-    Senão, tenta parsear do nome do arquivo '<YYYYMMDD>_symbol.npz'.
-    """
-    s = day.get("day")
-    if isinstance(s, str) and len(s) == 8 and s.isdigit():
-        return s
-    pat = re.compile(r"^(\d{8})_", re.IGNORECASE)
-    for k, p in day.items():
-        if k == "day":
-            continue
-        m = pat.match(Path(p).name)
-        if m:
-            return m.group(1)
-    return "unknown"
+def process_day(
+    data_dir: Path,
+    day: str,
+    pair: Tuple[str, str],
+    params: Optional[SegParams] = None,
+    imprimir=False
+) -> List[Dict[str, Any]]:
+    """Load and process a day's trading data into events.
 
-def process_day(out_dir, day, pair, params = None, imprimir=False, save=False, fillna = 0.0):
-    
-    import numpy as _np
-
+    This is a convenience function that ties together data loading,
+    segmentation and event collection. It expects that NPZ files are
+    named according to ``{day}_{symbol}.npz``. A new
+    :class:`EventSegmenter` is instantiated with the provided
+    parameters or default values based on the symbol pair. All events
+    produced are returned as a list of dictionaries.
+    """
+    files = find_files_for_day(data_dir, day, pair)
     sym_a, sym_b = pair[0].lower(), pair[1].lower()
-    path_a = day[sym_a]
-    path_b = day[sym_b]
-    day_str = _infer_day_str_from_paths(day)
-
-    t_a, TT_a = load_npz(path_a)
-    t_b, TT_b = load_npz(path_b)
+    if sym_a not in files or sym_b not in files:
+        raise FileNotFoundError(f"Missing NPZ files for symbols {pair} on day {day}")
+    t_a, TT_a = load_npz(files[sym_a])
+    t_b, TT_b = load_npz(files[sym_b])
     sec_a = group_by_second_preserving_order(to_epoch_seconds(t_a), TT_a, sym_a)
     sec_b = group_by_second_preserving_order(to_epoch_seconds(t_b), TT_b, sym_b)
     secs = sorted(set(sec_a.keys()) | set(sec_b.keys()))
@@ -171,31 +132,8 @@ def process_day(out_dir, day, pair, params = None, imprimir=False, save=False, f
         if imprimir:
             for ev in events_done:
                 print_event(ev)
-
-    if save:
-        # converte em matriz
-        first_vec = eventos[0].get("vector")
-        feature_order = list(first_vec.keys())  # mantém a ordem original de inserção
-        m = len(eventos)
-        n = len(feature_order)
-        mat = _np.full((m, n), fillna, dtype=float)
-        for i, ev in enumerate(eventos):
-            vec = ev.get("vector") or {}
-            for j, k in enumerate(feature_order):
-                v = vec.get(k, fillna)
-                try:
-                    mat[i, j] = float(v)
-                except Exception:
-                    mat[i, j] = fillna
-        # nome de saída
-        out_name = f"{day_str}_{pair[0]}_{pair[1]}.npy"
-        out_path = Path(out_dir) / out_name
-        _np.save(out_path, mat)
-        print(f"[ok] {day_str}: salvo {out_path} shape={mat.shape}")
-
+    if seg.evt is not None:
+        # Close the last event at end of day
+        seg.evt["end_reason"] = "eod"
+        eventos.append(seg.evt)
     return eventos, sec_a, sec_b
-
-
-
-
-

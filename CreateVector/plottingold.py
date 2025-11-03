@@ -112,6 +112,7 @@ def print_event_stats(eventos):
 
     # ================== PLOT TICK-A-TICK (tempo real no eixo X) ==================
 
+
 LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
 
 def _build_event_sec_map(eventos_list):
@@ -515,116 +516,32 @@ def plot_vector_item(
     plt.tight_layout()
     plt.show()
 
-def get_vector_series_source(
+# (Opcional) função para plotar rapidamente um grid de várias chaves básicas
+def plot_vector_grid(
     events: List[Dict[str, Any]],
-    item: str,
-    subitem: Optional[str] = None,
+    items: List[str],
+    ncols: int = 4,
+    subitems: Optional[Dict[str, str]] = None,
     xkey: Optional[str] = None,
-    dropna: bool = True,
-    source: str = "vector",
-) -> Tuple[np.ndarray, np.ndarray]:
+    figsize_per_plot: Tuple[float, float] = (3.2, 2.4),
+):
     """
-    Extrai (x, y) para plotar uma chave de um dicionário de vetores específico.
-
-    - events: lista de eventos
-    - item: nome da chave dentro do vetor
-    - subitem: se vector[item] for um dict, qual campo usar (ou tenta auto se None)
-    - xkey: se fornecido, usa events[i][xkey] como eixo-X
-    - dropna: remove NaNs
-    - source: nome do campo do evento onde está o vetor ("vector" ou "vector_norm", etc.)
-
-    Retorna arrays (x, y) filtrando NaNs conforme dropna.
+    Plota várias chaves em subplots (rápido para inspeção).
+    - subitems pode mapear item->subitem quando o valor for dict.
     """
-    xs, ys = [], []
-    for i, ev in enumerate(events):
-        # seleciona o dicionário de features
-        vec = ev.get(source, {}) or {}
-        val = vec.get(item, np.nan)
-        # eixo X
-        if xkey is not None:
-            x = ev.get(xkey, i)
-        else:
-            x = i
-        # valor Y
-        if isinstance(val, dict):
-            use_key = subitem or _prefer_subkey(val)
-            v = val.get(use_key, np.nan) if use_key is not None else np.nan
-            y = _to_float_or_nan(v)
-        else:
-            y = _to_float_or_nan(val)
-        xs.append(x)
-        ys.append(y)
-    x_arr = np.asarray(xs, dtype=float)
-    y_arr = np.asarray(ys, dtype=float)
-    if dropna:
-        m = np.isfinite(y_arr)
-        x_arr, y_arr = x_arr[m], y_arr[m]
-    return x_arr, y_arr
+    import math
+    n = len(items)
+    nrows = math.ceil(n / ncols)
+    plt.figure(figsize=(figsize_per_plot[0]*ncols, figsize_per_plot[1]*nrows))
 
-def plot_vector_comparison(
-    events: List[Dict[str, Any]],
-    item: str,
-    subitem: Optional[str] = None,
-    xkey: Optional[str] = None,
-    title: Optional[str] = None,
-    ylabel_orig: Optional[str] = None,
-    ylabel_norm: Optional[str] = None,
-    grid: bool = True,
-    figsize: Tuple[int, int] = (14, 4),
-    marker: Optional[str] = ".",
-    linewidth: float = 1.0,
-    sharex: bool = True,
-) -> None:
-    """
-    Plota lado a lado (subplots) a série original e a normalizada para uma chave do vetor.
-    Agora o título inclui a média do sinal normalizado (vector_norm).
-    """
-    # séries original e normalizada
-    x_orig, y_orig = get_vector_series_source(
-        events, item, subitem=subitem, xkey=xkey, dropna=True, source="vector"
-    )
-    x_norm, y_norm = get_vector_series_source(
-        events, item, subitem=subitem, xkey=xkey, dropna=True, source="vector_norm"
-    )
+    for i, it in enumerate(items, 1):
+        sub = (subitems or {}).get(it)
+        x, y = get_vector_series(events, it, subitem=sub, xkey=xkey, dropna=True)
+        ax = plt.subplot(nrows, ncols, i)
+        ax.plot(x, y, marker=".", linewidth=1.0)
+        ax.set_title(it if sub is None else f"{it}.{sub}", fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=8)
 
-    # base label
-    base_label = item if subitem is None else f"{item}.{subitem}"
-
-    # calcula média do normalizado para colocar no título
-    if y_norm.size > 0:
-        m = np.nanmean(y_norm[np.isfinite(y_norm)])
-        mean_str = f"{m:.3f}"
-    else:
-        mean_str = "nan"
-
-    # prepara título e labels
-    auto_title = f"{base_label}: original vs normalizado"
-    full_title = (title or auto_title) + f" | mean(norm)={mean_str}"
-
-    if ylabel_orig is None:
-        ylabel_orig = base_label + " (original)"
-    if ylabel_norm is None:
-        ylabel_norm = base_label + " (norm.)"
-
-    # figura com 2 subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize, sharex=sharex)
-
-    # original
-    ax1.plot(x_orig, y_orig, marker=marker if marker else None, linewidth=linewidth)
-    ax1.set_xlabel(xkey or "evento")
-    ax1.set_ylabel(ylabel_orig)
-    ax1.set_title("Original")
-    if grid:
-        ax1.grid(True, alpha=0.3)
-
-    # normalizado
-    ax2.plot(x_norm, y_norm, marker=marker if marker else None, linewidth=linewidth)
-    ax2.set_xlabel(xkey or "evento")
-    ax2.set_ylabel(ylabel_norm)
-    ax2.set_title("Normalizado")
-    if grid:
-        ax2.grid(True, alpha=0.3)
-
-    fig.suptitle(full_title)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.tight_layout()
     plt.show()

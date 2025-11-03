@@ -223,7 +223,7 @@ def _group_stats_one_symbol_local(trades: List[List[float]], tick: float) -> Tup
 
 def _stats_list(lst: List[float]) -> Dict[str, float | int]:
     if not lst:
-        return {"mean": 0.0, "min": 0.0, "max": 0.0, "n": 0}
+        return {"mean": 0.0, "max": 0.0, "sum": 0}
     arr = np.asarray(lst, dtype=float)
     return {"mean": float(arr.mean()), "max": float(arr.max()), "sum": float(arr.sum())}
 
@@ -429,66 +429,174 @@ def event_accumulate_second(
             ev_acc["retrace_secs"]  = 0
 
     # --- tops (derivados do estado do dia) ---
+    TOP_K = int(getattr(p, "top_k_players", 3))
+
+    def _top_sets_by_state(state: Optional[Dict[int, Dict[str, float]]], k: int = 5):
+        if not state:
+            return set(), set()
+        has_cum = any(("cum_buy" in v or "cum_sell" in v) for v in state.values())
+        if has_cum:
+            buyers = sorted(((aid, float(v.get("cum_buy", 0.0))) for aid, v in state.items()),
+                            key=lambda kv: kv[1], reverse=True)
+            sellers = sorted(((aid, float(v.get("cum_sell", 0.0))) for aid, v in state.items()),
+                             key=lambda kv: kv[1], reverse=True)
+            buyers = [aid for aid, vol in buyers if vol > 0][:k]
+            sellers = [aid for aid, vol in sellers if vol > 0][:k]
+        else:
+            buyers = sorted(((aid, float(v.get("pos", 0.0))) for aid, v in state.items() if float(v.get("pos", 0.0)) > 0),
+                            key=lambda kv: kv[1], reverse=True)
+            sellers = sorted(((aid, -float(v.get("pos", 0.0))) for aid, v in state.items() if float(v.get("pos", 0.0)) < 0),
+                             key=lambda kv: kv[1], reverse=True)
+            buyers = [aid for aid, _ in buyers][:k]
+            sellers = [aid for aid, _ in sellers][:k]
+        return set(buyers), set(sellers)
+
     topB_a, topS_a = _top_sets_by_state(player_state_a, TOP_K)
     topB_b, topS_b = _top_sets_by_state(player_state_b, TOP_K)
 
-    # função interna: acumula participação dado trades e conjuntos top
-    def _accumulate_top_participation(trades, topB: set, topS: set, sgn_dir: int, which: str):
-        """
-        sgn_dir: +1 para alta, -1 para baixa, 0 = neutro (ignora)
-        which: "a" ou "b"
-        Regras:
-          - sgn>0 (alta): +lote se (ag=1 e buyer ∈ topB), -lote se (ag=2 e seller ∈ topS)
-          - sgn<0 (baixa): +lote se (ag=2 e seller ∈ topS), -lote se (ag=1 e buyer ∈ topB)
-        Também mantém contadores crus top_buy_vol_* e top_sell_vol_* (independente de direção).
-        """
-        if sgn_dir == 0:
-            return 0.0
+    # garantir chaves no acumulador
+    for key in [
+        # por símbolo
+        "topB_buy_vol_a","topB_sell_vol_a","topS_buy_vol_a","topS_sell_vol_a",
+        "topB_buy_vol_b","topB_sell_vol_b","topS_buy_vol_b","topS_sell_vol_b",
+        "topB_net_long_a","topB_net_long_b","topS_net_long_a","topS_net_long_b",
+        # totais A+B
+        "topB_buy_vol","topB_sell_vol","topS_buy_vol","topS_sell_vol",
+        "topB_net_long","topS_net_long",
+    ]:
+        ev_acc.setdefault(key, 0.0)
 
-        dir_acc = 0.0
+    def _accumulate_top_side(trades, topB: set, topS: set):
+        """Retorna volumes: (comprados_comprando, comprados_vendendo, vendidos_comprando, vendidos_vendendo)"""
+        b_buy = b_sell = s_buy = s_sell = 0.0
         for tr in trades:
             lote = float(tr[1]) if len(tr) > 1 else 0.0
-            ag   = int(tr[4]) if len(tr) > 4 else 0    # 1=buy, 2=sell
-            b_comp = int(tr[2]) if len(tr) > 2 else -1
-            b_vend = int(tr[3]) if len(tr) > 3 else -1
+            agc  = int(tr[2]) if len(tr) > 2 else -1  # comprador do negócio
+            agv  = int(tr[3]) if len(tr) > 3 else -1  # vendedor do negócio
 
-            # contadores crus (mantém compatibilidade com o que você já tinha)
-            if which == "a":
-                if ag == 1 and b_comp in topB: ev_acc["top_buy_vol_a"]  += lote
-                if ag == 2 and b_vend in topS: ev_acc["top_sell_vol_a"] += lote
+            # 'Comprados' (top buyers do dia)
+            if agc in topB: b_buy += lote   # comprados comprando -> aumentam posição
+            if agv in topB: b_sell += lote  # comprados vendendo  -> reduzem posição
+
+            # 'Vendidos' (top sellers do dia)
+            if agc in topS: s_buy += lote   # vendidos comprando -> reduzem short (cobrem)
+            if agv in topS: s_sell += lote  # vendidos vendendo  -> aumentam short
+
+        return b_buy, b_sell, s_buy, s_sell
+
+    # símbolo A
+    bb_a, bs_a, sb_a, ss_a = _accumulate_top_side(trades_a, topB_a, topS_a)
+    ev_acc["topB_buy_vol_a"]  += bb_a
+    ev_acc["topB_sell_vol_a"] += bs_a
+    ev_acc["topS_buy_vol_a"]  += sb_a
+    ev_acc["topS_sell_vol_a"] += ss_a
+    ev_acc["topB_net_long_a"] += (bb_a - bs_a)  # >0 = comprados aumentando posição
+    ev_acc["topS_net_long_a"] += (sb_a - ss_a)  # >0 = vendidos reduzindo short
+
+    # símbolo B
+    bb_b, bs_b, sb_b, ss_b = _accumulate_top_side(trades_b, topB_b, topS_b)
+    ev_acc["topB_buy_vol_b"]  += bb_b
+    ev_acc["topB_sell_vol_b"] += bs_b
+    ev_acc["topS_buy_vol_b"]  += sb_b
+    ev_acc["topS_sell_vol_b"] += ss_b
+    ev_acc["topB_net_long_b"] += (bb_b - bs_b)
+    ev_acc["topS_net_long_b"] += (sb_b - ss_b)
+
+    # totais A+B para facilitar análise
+    ev_acc["topB_buy_vol"]  += (bb_a + bb_b)
+    ev_acc["topB_sell_vol"] += (bs_a + bs_b)
+    ev_acc["topS_buy_vol"]  += (sb_a + sb_b)
+    ev_acc["topS_sell_vol"] += (ss_a + ss_b)
+    ev_acc["topB_net_long"] += (bb_a - bs_a) + (bb_b - bs_b)
+    ev_acc["topS_net_long"] += (sb_a - ss_a) + (sb_b - ss_b)
+
+    # (opcional) registrar por segundo no vetor persec
+    if ev_acc.get("persec"):
+        ev_acc["persec"][-1]["topB_buy"]   = bb_a + bb_b
+        ev_acc["persec"][-1]["topB_sell"]  = bs_a + bs_b
+        ev_acc["persec"][-1]["topS_buy"]   = sb_a + sb_b
+        ev_acc["persec"][-1]["topS_sell"]  = ss_a + ss_b
+        ev_acc["persec"][-1]["topB_net"]   = (bb_a - bs_a) + (bb_b - bs_b)
+        ev_acc["persec"][-1]["topS_net"]   = (sb_a - ss_a) + (sb_b - ss_b)
+
+    # --- reconstrução do book + absorção por símbolo (NOVO) ---
+    def _ensure_book_state(ev_acc: Dict[str, object], key: str):
+        st = ev_acc.get(key)
+        if st is None:
+            st = {
+                "bid": None, "ask": None,        # topo atual
+                "bid_ref": None, "ask_ref": None,# âncoras do segmento
+                "sell_since_bid": 0.0,           # vendas desde última mudança de bid
+                "buy_since_ask": 0.0,            # compras desde última mudança de ask
+                "abs_sell_sum": 0.0,             # Σ (vendas acumuladas / Δbid_ticks)
+                "abs_buy_sum": 0.0,              # Σ (compras acumuladas / Δask_ticks)
+            }
+            ev_acc[key] = st
+        return st
+
+    def _process_trades_for_symbol(trades, st, tick):
+        if not trades:
+            return
+        for tr in trades:
+            if len(tr) < 5:
+                continue
+            price = float(tr[0])
+            lot   = float(tr[1])
+            aggr  = int(tr[4])  # 1=buy, 2=sell, outros=neutro
+
+            # Deriva novo topo do book assumindo spread de 1 tick
+            new_bid, new_ask = st["bid"], st["ask"]
+            if aggr == 1:
+                new_ask = price
+                new_bid = new_ask - tick
+            elif aggr == 2:
+                new_bid = price
+                new_ask = new_bid + tick
             else:
-                if ag == 1 and b_comp in topB: ev_acc["top_buy_vol_b"]  += lote
-                if ag == 2 and b_vend in topS: ev_acc["top_sell_vol_b"] += lote
+                # neutro: não move topo (sem dados de quote)
+                if st["bid"] is None and st["ask"] is None:
+                    continue  # sem base para iniciar
 
-            # participação direcional (soma se alinha, subtrai se contrária)
-            if sgn_dir > 0:
-                if ag == 1 and b_comp in topB:
-                    dir_acc += lote       # buy em alta -> a favor
-                if ag == 2 and b_vend in topS:
-                    dir_acc -= lote       # sell em alta -> contra
-            else:  # sgn_dir < 0
-                if ag == 2 and b_vend in topS:
-                    dir_acc += lote       # sell em baixa -> a favor
-                if ag == 1 and b_comp in topB:
-                    dir_acc -= lote       # buy em baixa -> contra
+            # 1) se ASK mudou, fecha segmento de ASK -> usa buys acumuladas
+            if (st["ask"] is not None) and (new_ask is not None) and (new_ask != st["ask"]):
+                if st["ask_ref"] is None:
+                    st["ask_ref"] = st["ask"]
+                delta_ticks = abs(new_ask - st["ask_ref"]) / float(tick)
+                if (delta_ticks) > 0.0:
+                    st["abs_buy_sum"] += (st["buy_since_ask"] / delta_ticks)
+                st["buy_since_ask"] = 0.0
+                st["ask_ref"] = new_ask
 
-        if which == "a":
-            ev_acc["top_dir_part_a"] += dir_acc
-        else:
-            ev_acc["top_dir_part_b"] += dir_acc
+            # 2) se BID mudou, fecha segmento de BID -> usa sells acumuladas
+            if (st["bid"] is not None) and (new_bid is not None) and (new_bid != st["bid"]):
+                if st["bid_ref"] is None:
+                    st["bid_ref"] = st["bid"]
+                delta_ticks = abs(new_bid - st["bid_ref"]) / float(tick)
+                if (delta_ticks) > 0.0:
+                    st["abs_sell_sum"] += (st["sell_since_bid"] / delta_ticks)
+                st["sell_since_bid"] = 0.0
+                st["bid_ref"] = new_bid
 
-        return dir_acc
+            # acumula volume do trade atual (após fechar segmentos)
+            if aggr == 1:
+                st["buy_since_ask"] += lot
+            elif aggr == 2:
+                st["sell_since_bid"] += lot
 
-    # acumula por símbolo e totaliza
-    part_a = _accumulate_top_participation(trades_a, topB_a, topS_a, sgn, "a")
-    part_b = _accumulate_top_participation(trades_b, topB_b, topS_b, sgn, "b")
-    ev_acc["top_dir_part"] += (part_a + part_b)
+            # inicializações das âncoras se for a primeira vez
+            if st["ask"] is None and new_ask is not None and st["ask_ref"] is None:
+                st["ask_ref"] = new_ask
+            if st["bid"] is None and new_bid is not None and st["bid_ref"] is None:
+                st["bid_ref"] = new_bid
 
-    # opcional: registrar por segundo no vetor persec, junto do que você já salva
-    if ev_acc["persec"]:
-        ev_acc["persec"][-1]["top_part_a"] = part_a
-        ev_acc["persec"][-1]["top_part_b"] = part_b
-        ev_acc["persec"][-1]["top_part"]   = part_a + part_b
+            # atualiza topo do book
+            st["ask"] = new_ask if new_ask is not None else st["ask"]
+            st["bid"] = new_bid if new_bid is not None else st["bid"]
+
+    book_a = _ensure_book_state(ev_acc, "book_a")
+    book_b = _ensure_book_state(ev_acc, "book_b")
+    _process_trades_for_symbol(trades_a, book_a, float(tick_a))
+    _process_trades_for_symbol(trades_b, book_b, float(tick_b))
 
 
 # ===== 3) enriquecimento final simplificado =====
@@ -501,6 +609,16 @@ def finalize_event_enrichment(
     extrair_preco_fn = lambda arr: np.zeros((1,5), dtype=float),
 ) -> Dict[str, object]:
 
+    def _nz(x, fallback):
+        """Se x for None/NaN, retorna fallback; senão, float(x)."""
+        try:
+            xf = float(x)
+            if math.isnan(xf):
+                return float(fallback)
+            return xf
+        except Exception:
+            return float(fallback)
+        
     acc = ev.pop("acc", None)
     if not acc:
         return ev
@@ -514,18 +632,24 @@ def finalize_event_enrichment(
         if not d: return None, 0.0
         k, v = max(d.items(), key=lambda kv: kv[1])
         return k, float(v)
-
-    price_most_traded, _ = _argmax(acc["price_count"])
-    price_most_volume, _ = _argmax(acc["price_vol"])
-    price_most_time,   _ = _argmax(acc["secs_at_price"])
-
-    # Chaves básicas do evento (seguindo seu step simplificado)
+    
+        # Chaves básicas do evento (seguindo seu step simplificado)
     p_open  = float(ev.get("open", 0.0))
     p_close = float(ev.get("close", 0.0))
     p_high  = float(ev.get("max", 0.0))
     p_low   = float(ev.get("min", 0.0))
     dur     = int(ev.get("dur", 0))
     rng     = ev.get("range")
+
+    price_most_traded, _ = _argmax(acc["price_count"])
+    price_most_volume, _ = _argmax(acc["price_vol"])
+    price_most_time,   _ = _argmax(acc["secs_at_price"])
+    # Protege preços de referência que podem vir None
+    price_most_traded = _nz(price_most_traded, p_open)
+    price_most_volume = _nz(price_most_volume, p_open)
+    price_most_time   = _nz(price_most_time,   p_open)
+
+
     dp = p_open - p_close
     dmx = p_open - p_high
     dmm = p_open - p_low
@@ -553,23 +677,42 @@ def finalize_event_enrichment(
     buy_share_a  = (buy_a / (buy_a + buy_b)) if (buy_a + buy_b) > 0 else 0.0
     sell_share_a = (sell_a / (sell_a + sell_b)) if (sell_a + sell_b) > 0 else 0.0
 
-    # 4.3 absorção
-    def _abs_stats(lst: List[Dict[str, float]]) -> Dict[str, float]:
-        if not lst:
-            return {"count": 0, "ticks_mean": 0.0, "ticks_max": 0.0, "vel_mean": 0.0}
-        ticks = np.asarray([x["ticks"] for x in lst], dtype=float)
-        vels  = np.asarray([x["ticks"]/max(1, x["secs"]) for x in lst], dtype=float)
-        return {"count": len(lst), "ticks_mean": float(ticks.mean()), "ticks_max": float(ticks.max()), "vel_mean": float(vels.mean())}
+    # 4.3 absorção (NOVO) - flush final dos segmentos ainda abertos
+    def _flush_absorption(book_state: Dict[str, object], tick: float):
+        if not book_state:
+            return
+        eps = 1e-9
+        # flush ASK
+        ask     = book_state.get("ask", None)
+        ask_ref = book_state.get("ask_ref", None)
+        if ask is not None and ask_ref is not None:
+            delta_ticks = abs(float(ask) - float(ask_ref)) / float(tick)
+            if (delta_ticks) > eps:
+                book_state["abs_buy_sum"] += (float(book_state.get("buy_since_ask", 0.0)) / delta_ticks)
+            book_state["buy_since_ask"] = 0.0
+            book_state["ask_ref"] = float(ask)
+        # flush BID
+        bid     = book_state.get("bid", None)
+        bid_ref = book_state.get("bid_ref", None)
+        if bid is not None and bid_ref is not None:
+            delta_ticks = abs(float(bid) - float(bid_ref)) / float(tick)
+            if (delta_ticks) > eps:
+                book_state["abs_sell_sum"] += (float(book_state.get("sell_since_bid", 0.0)) / delta_ticks)
+            book_state["sell_since_bid"] = 0.0
+            book_state["bid_ref"] = float(bid)
 
-    abs_buy = _abs_stats(acc["absorb_buy"])
-    abs_sell= _abs_stats(acc["absorb_sell"])
+    book_a = acc.get("book_a", None)
+    book_b = acc.get("book_b", None)
+    if book_a: _flush_absorption(book_a, float(tick_a))
+    if book_b: _flush_absorption(book_b, float(tick_b))
 
-    # 4.4 facilidade do deslocamento (ref WDO)
-    net_ticks = abs(ticks_delta(p_open, p_close, tick_a))
-    dir_sign = 1 if (p_close - p_open) > 0 else (-1 if (p_close - p_open) < 0 else 0)
-    opp_vol = (sell_a + sell_b) if dir_sign > 0 else ((buy_a + buy_b) if dir_sign < 0 else 0.0)
-    ease_of_move = (net_ticks / max(1.0, opp_vol)) if dir_sign != 0 else 0.0
+    absorption_buy_a  = float(book_a.get("abs_buy_sum", 0.0)) if book_a else 0.0
+    absorption_sell_a = float(book_a.get("abs_sell_sum", 0.0)) if book_a else 0.0
+    absorption_buy_b  = float(book_b.get("abs_buy_sum", 0.0)) if book_b else 0.0
+    absorption_sell_b = float(book_b.get("abs_sell_sum", 0.0)) if book_b else 0.0
 
+    ease_of_move_a = abs(absorption_buy_a) - abs(absorption_sell_a)
+    ease_of_move_b = abs(absorption_buy_b) - abs(absorption_sell_b)
     # SMA 15m do preço do WDO usando buffer de 30m do metrics (1Hz). Janela = 900s.
     d5m = p_close - metrics.mean_price_5m
     d30 = p_close - metrics.mean_price_30m
@@ -580,6 +723,10 @@ def finalize_event_enrichment(
     ctx_price = p_close  # último preço WDO do evento
     ctx_feats = extrair_preco_fn(np.array([float(ctx_price)], dtype=float))[0].tolist()
 
+    vol_per_tick_up_a =  _stats_list(up_a)
+    vol_per_tick_dn_a =  _stats_list(dn_a)
+    vol_per_tick_up_b =  _stats_list(up_b)
+    vol_per_tick_dn_b =  _stats_list(dn_b)
 
     ev["vector"] = {
         "dt": dur,
@@ -613,19 +760,34 @@ def finalize_event_enrichment(
         "ema_vol_total": float(getattr(metrics, "ema_vol_total", 0.0) or 0.0),
         "ema_order_rate": float(getattr(metrics, "ema_order_rate", 0.0) or 0.0),
         "d_ticks_max": float(acc["max_group_ticks"]),
-        "vol_per_tick_up_a":  _stats_list(up_a),
-        "vol_per_tick_dn_a":  _stats_list(dn_a),
-        "vol_per_tick_up_b":  _stats_list(up_b),
-        "vol_per_tick_dn_b":  _stats_list(dn_b),
+        "vol_per_tick_up_a_mean":  vol_per_tick_up_a["mean"],
+        "vol_per_tick_up_a_max":  vol_per_tick_up_a["max"],
+        "vol_per_tick_up_a_sum":  vol_per_tick_up_a["sum"],
+        "vol_per_tick_dn_a_mean":  vol_per_tick_dn_a["mean"],
+        "vol_per_tick_dn_a_max":  vol_per_tick_dn_a["max"],
+        "vol_per_tick_dn_a_sum":  vol_per_tick_dn_a["sum"],
+        "vol_per_tick_up_b_mean":  vol_per_tick_up_b["mean"],
+        "vol_per_tick_up_b_max":  vol_per_tick_up_b["max"],
+        "vol_per_tick_up_b_sum":  vol_per_tick_up_b["sum"],
+        "vol_per_tick_dn_b_mean":  vol_per_tick_dn_b["mean"],
+        "vol_per_tick_dn_b_max":  vol_per_tick_dn_b["max"],
+        "vol_per_tick_dn_b_sum":  vol_per_tick_dn_b["sum"],
         "buy_share_wdo":  float(buy_share_a),
         "sell_share_wdo": float(sell_share_a),
-        "absorptions_buy":  abs_buy,
-        "absorptions_sell": abs_sell,
-        "ease_of_move": float(ease_of_move),
-        "top_buy_vol_wdo": float(acc["top_buy_vol_a"]),
-        "top_sell_vol_wdo": float(acc["top_sell_vol_a"]),
-        "top_buy_vol_dol": float(acc["top_buy_vol_b"]),
-        "top_sell_vol_dol": float(acc["top_sell_vol_b"]),
+        "ease_of_move_a": ease_of_move_a,
+        "ease_of_move_b": ease_of_move_b,
+        "absorption_buy_a":  absorption_buy_a,
+        "absorption_sell_a": absorption_sell_a,
+        "absorption_buy_b":  absorption_buy_b,
+        "absorption_sell_b": absorption_sell_b,
+        "topB_buy_vol_a": float(acc["topB_buy_vol_a"]), 
+        "topB_sell_vol_a": float(acc["topB_sell_vol_a"]),
+        "topS_buy_vol_a": float(acc["topS_buy_vol_a"]),
+        "topS_sell_vol_a": float(acc["topS_sell_vol_a"]),
+        "topB_buy_vol_b": float(acc["topB_buy_vol_b"]), 
+        "topB_sell_vol_b": float(acc["topB_sell_vol_b"]),
+        "topS_buy_vol_b": float(acc["topS_buy_vol_b"]),
+        "topS_sell_vol_b": float(acc["topS_sell_vol_b"]),
     }
 
     return ev
