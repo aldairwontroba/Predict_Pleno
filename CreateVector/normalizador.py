@@ -29,7 +29,7 @@ def list_daily_files(folder: Path, pair: Tuple[str, str]) -> List[Path]:
     Ex.: 20181205_wdo_dol.npy
     """
     a, b = pair[0].lower(), pair[1].lower()
-    pat = f"*_{a}_{b}.npy"
+    pat = f"*_{a}_{b}_norm.npy"
     return sorted(folder.glob(pat))
 
 # === Carregamento de um dia ===
@@ -173,7 +173,7 @@ if __name__ == "__main__":
         data_folder=DATA_DIR,
         pair=PAIR,
         scaler_pkl=SCALER_PKL,
-        out_suffix="_norm",
+        out_suffix="_norm_norm",
         overwrite=False
     )
 

@@ -104,7 +104,7 @@ def print_norm_stats_table(Xn: np.ndarray, feat_names: List[str], sat_thr: float
         rows.append((name, mu, sd, sk, ku, sat))
 
     # ordena por |mean| desc só para destacar os piores centramentos
-    rows.sort(key=lambda r: abs(r[1] if np.isfinite(r[1]) else 0.0), reverse=True)
+    # rows.sort(key=lambda r: abs(r[1] if np.isfinite(r[1]) else 0.0), reverse=True)
 
     print(f"{'feature':<32} {'mean':>8} {'std':>8} {'skew':>8} {'kurt':>8} {'sat%':>8}")
     print("-" * 72)
@@ -117,18 +117,41 @@ def plot_original_vs_normalized(
     y_orig: np.ndarray,
     y_norm: np.ndarray,
     feat_name: str,
-    figsize=(13,4),
+    figsize=(13, 4),
     marker=".",
     linewidth=1.0,
-    grid=True
+    grid=True,
+    bins="auto",              # nº de bins do histograma
 ) -> None:
     """
-    Plota lado-a-lado (original vs normalizado) com média do normalizado no título.
+    Plota séries (original x normalizado) e, abaixo, a distribuição (histogramas)
+    com linhas verticais nos valores mínimo e máximo.
     """
-    mu_norm = float(np.nanmean(y_norm)) if y_norm.size else float("nan")
+    y_orig = np.asarray(y_orig, dtype=float)
+    y_norm = np.asarray(y_norm, dtype=float)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize, sharex=False)
+    y0 = y_orig[np.isfinite(y_orig)]
+    y1 = y_norm[np.isfinite(y_norm)]
 
+    mu_norm = float(np.nanmean(y1)) if y1.size else float("nan")
+    std_norm = float(np.nanstd(y1)) if y1.size else float("nan")
+
+    # limites min/max (ignorando NaNs)
+    if y0.size:
+        min0, max0 = float(np.nanmin(y0)), float(np.nanmax(y0))
+    else:
+        min0 = max0 = np.nan
+    if y1.size:
+        min1, max1 = float(np.nanmin(y1)), float(np.nanmax(y1))
+    else:
+        min1 = max1 = np.nan
+
+    # figura 2x2 (topo: séries; base: distribuições)
+    w, h = figsize
+    fig, axes = plt.subplots(2, 2, figsize=(w, h * 2), sharex=False)
+    (ax1, ax2), (ax3, ax4) = axes
+
+    # --- topo: séries temporais ---
     ax1.plot(np.arange(y_orig.size), y_orig, marker=marker, linewidth=linewidth)
     ax1.set_title("Original")
     ax1.set_xlabel("amostra")
@@ -141,7 +164,30 @@ def plot_original_vs_normalized(
     ax2.set_ylabel(f"{feat_name} (norm.)")
     if grid: ax2.grid(True, alpha=0.3)
 
-    fig.suptitle(f"{feat_name} — mean(norm)={mu_norm:.3f}")
+    # --- base: distribuições + min/max ---
+    if y0.size:
+        ax3.hist(y0, bins=bins, range=(min0, max0))
+        ax3.axvline(min0, linestyle="--", linewidth=1)
+        ax3.axvline(max0, linestyle="--", linewidth=1)
+        ax3.set_title("Distribuição (original)")
+        ax3.set_xlabel(feat_name)
+        ax3.set_ylabel("contagem")
+        ax3.text(0.02, 0.95, f"min={min0:.3g}\nmax={max0:.3g}",
+                 transform=ax3.transAxes, va="top", ha="left")
+        if grid: ax3.grid(True, alpha=0.3)
+
+    if y1.size:
+        ax4.hist(y1, bins=bins, range=(min1, max1))
+        ax4.axvline(min1, linestyle="--", linewidth=1)
+        ax4.axvline(max1, linestyle="--", linewidth=1)
+        ax4.set_title("Distribuição (normalizado)")
+        ax4.set_xlabel(f"{feat_name} (norm.)")
+        ax4.set_ylabel("contagem")
+        ax4.text(0.02, 0.95, f"min={min1:.3g}\nmax={max1:.3g}",
+                 transform=ax4.transAxes, va="top", ha="left")
+        if grid: ax4.grid(True, alpha=0.3)
+
+    fig.suptitle(f"{feat_name} — mean(norm)={mu_norm:.3f}, std(norm)={std_norm:.3f}")
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.show()
 
@@ -168,6 +214,8 @@ def analyze_day(
 
     idxs = list(range(X.shape[1])) if plot_all and selected is None else (selected or [])
     for j in idxs:
+        if j <= -1:
+            continue
         name = feat_names[j]
         y0 = X[:, j]
         y1 = Xn[:, j]
@@ -176,7 +224,7 @@ def analyze_day(
 if __name__ == "__main__":
     # ===== CONFIGURAÇÃO RÁPIDA =====
     DATA_DIR = Path(r"E:\Mercado BMF&BOVESPA\tryd\eventos_processados")  # onde estão os .npy
-    DAY      = "20181205"                                               # selecione o dia
+    DAY      = "20200310"                                               # selecione o dia
     PAIR     = ("wdo", "dol")
     # Se você salvou os nomes de features:
     FEATURE_ORDER_JSON = None  # Path(r"E:\...\feature_order.json")

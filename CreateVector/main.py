@@ -197,6 +197,6 @@ if __name__ == "__main__":
         realtime_process(PAIR)
 
     else:
-        startdate = "20180101"
-        enddate = "20251231"
+        startdate = "20200308"
+        enddate = "20200316"
         process_all(DATA_DIR, PAIR, startdate, enddate, out_dir, n_workers=None) 
