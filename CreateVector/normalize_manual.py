@@ -77,236 +77,140 @@ def _finite(col: np.ndarray) -> np.ndarray:
 # - log            : bool (usa log1p para dados positivos)
 # - gamma/invert   : igual ao seu código anterior
 
-MANUAL_NORM_CONF = {
+MANUAL_NORM_CONF: Dict[str, Dict[str, Any]] = {
 
-    "dt":   {"enabled": True,  "low": 3,  "high": 30, "gamma": 1.0, "invert": False, "log": True,  "softness": 0.1, "gain": 1.2},
-    "dp":   {"enabled": True,  "low": -2,  "high": 2, "gamma": 1.0, "invert": False, "log": False,  "softness": 0.01, "gain": 1.0},
-    "dmx":  {"enabled": True,  "low": -2.0, "high": 0.0,  "gamma": 1.0, "invert": True,  "log": False, "softness": 0.05, "gain": 1.0},
-    "dmm":  {"enabled": True,  "low":  0.0, "high": 2.0,  "gamma": 1.0, "invert": False,  "log": False, "softness": 0.05, "gain": 1.0},
-    "dmt":  {"enabled": True,  "low": -2.0, "high": 2.0,  "gamma": 1.0, "invert": False,  "log": False, "softness": 0.05, "gain": 1.0},
-    "dmv":  {"enabled": True,  "low": -2.0, "high": 2.0,  "gamma": 1.0, "invert": False,  "log": False, "softness": 0.05, "gain": 1.0},
-    "dvwap":  {"enabled": True,  "low": -20.0, "high": 20.0,  "gamma": 1.0, "invert": False,  "log": False, "softness": 0.1, "gain": 1.0},
-    "ddayo":  {"enabled": True,  "low":  -30.0, "high": 30.0,  "gamma": 1.0, "invert": False,  "log": False, "softness": 0.1, "gain": 1.0},
-    "d5m":  {"enabled": True,  "low": -5.0, "high": 5.0, "gamma": 1.0, "invert": False,  "log": False, "softness": 0.1, "gain": 1.0},
-    "d30m":  {"enabled": True,  "low": -10.0, "high": 10.0, "gamma": 1.0, "invert": False,  "log": False, "softness": 0.1, "gain": 1.0},
-    "rng":  {"enabled": True,  "low": 0.5,  "high": 3.0, "gamma": 0.9, "invert": False, "log": True,  "softness": 0.05, "gain": 1.2},
-    "efrang": {"enabled": True,"low": 0.0,  "high": 1.0, "gamma": 1.0, "invert": False, "log": False, "softness": 0.02, "gain": 1.0},
+    "dt":   {"enabled": True,  "low":    3, "high":  40,  "gamma": 1,  "invert": False, "log":  True, "log_scale": 0.1, "skew": -1.0,  "softness": 1},
+    "dp":   {"enabled": True,  "low":   -2, "high":   2,  "gamma": 1,  "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "dmx":  {"enabled": True,  "low": -2.0, "high": 0.0,  "gamma": 1,  "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "dmm":  {"enabled": True,  "low":  0.0, "high": 2.0,  "gamma": 1,  "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "dmt":  {"enabled": True,  "low": -2.0, "high": 2.0,  "gamma": 1,  "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "dmv":  {"enabled": True,  "low": -2.0, "high": 2.0,  "gamma": 1,  "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "dvwap":  {"enabled": True,  "low": -20.0, "high": 20.0,  "gamma": 1,  "invert": False, "log": False,  "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "ddayo":  {"enabled": True,  "low": -30.0, "high": 30.0,  "gamma": 1,  "invert": False, "log": False,  "log_scale": 0.1, "skew":  0.0,  "softness": 0.5},
+    "d5m":    {"enabled": True,  "low":  -5.0, "high":  5.0,  "gamma": 1,  "invert": False, "log": False,  "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "d30m":   {"enabled": True,  "low": -10.0, "high": 10.0,  "gamma": 1,  "invert": False, "log": False,  "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "rng":    {"enabled": True,  "low":   0.5,  "high": 3.0,  "gamma": 1, "invert": False, "log": False,  "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "efrang": {"enabled": True,  "low":   0.0,  "high": 1.0,  "gamma": 1, "invert": False, "log": False,  "log_scale": 0.1, "skew":  0.0,  "softness": 1},
 
-    "b_vol": {"enabled": True, "low": 5, "high": 10000, "gamma": 1.0, "invert": False, "log": False, "softness": 0.01, "gain": 1.0},
-    "s_vol": {"enabled": True, "low": 5, "high": 10000, "gamma": 1.0, "invert": False, "log": False, "softness": 0.01, "gain": 1.0},
-    "t_vol": {"enabled": True, "low": 1000, "high": 10000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "d_vol": {"enabled": True, "low": -5000, "high": 5000, "gamma": 0.7, "invert": False, "log": False, "softness": 0.1, "gain": 1.0},
-    "avg_vol": {"enabled": True, "low": 5, "high": 95, "gamma": 0.7, "invert": False, "log": True, "softness": 0.05, "gain": 1.0},
+    "b_vol":   {"enabled": True, "low": 0,     "high": 3000, "gamma": 0.7, "invert": False, "log": True, "log_scale": 20, "skew":  100.0,  "softness": 2},
+    "s_vol":   {"enabled": True, "low": 0,     "high": 3000, "gamma": 0.7, "invert": False, "log": True, "log_scale": 20, "skew":  100.0,  "softness": 2},
+    "t_vol":   {"enabled": True, "low": 1000,  "high": 10000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "d_vol":   {"enabled": True, "low": -5000, "high":  5000, "gamma": 0.7, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "avg_vol": {"enabled": True, "low": 5,     "high":    95, "gamma": 0.7, "invert": False, "log":  True, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
 
-    "g_b": {"enabled": True, "low": 5, "high": 50, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "g_s": {"enabled": True, "low": 5, "high": 50, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "g_n": {"enabled": True, "low": 2, "high": 30, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
+    "g_b": {"enabled": True, "low": 5, "high": 50, "gamma": 1.0, "invert": False, "log": True, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "g_s": {"enabled": True, "low": 5, "high": 50, "gamma": 1.0, "invert": False, "log": True, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "g_n": {"enabled": True, "low": 2, "high": 30, "gamma": 1.0, "invert": False, "log": True, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
 
-    "rate_avg": {"enabled": True, "low": 5, "high": 95, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
+    "rate_avg": {"enabled": True, "low": 5, "high": 95, "gamma": 1.0, "invert": False, "log": True, "log_scale": 0.1, "skew":  0.0,  "softness": 1.5},
     
-    "max_streak_buy": {"enabled": True, "low": 0, "high": 15, "gamma": 1.0, "invert": False, "log": False, "softness": 0.01, "gain": 1.0},
-    "max_streak_sell": {"enabled": True, "low": 0, "high": 15, "gamma": 1.0, "invert": False, "log": False, "softness": 0.01, "gain": 1.0},
+    "max_streak_buy": {"enabled": True, "low": 0, "high": 10, "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "max_streak_sell": {"enabled": True, "low": 0, "high": 10, "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
 
-    "ema_vol_total": {"enabled": True, "low": 300, "high": 1000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "ema_order_rate": {"enabled": True, "low": 5, "high": 70, "gamma": 1.0, "invert": False, "log": True, "softness": 0.03, "gain": 1.2},
+    "ema_vol_total": {"enabled": True, "low": 200, "high": 800, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  1.0,  "softness": 1},
+    "ema_order_rate": {"enabled": True, "low": 5, "high": 66, "gamma": 1, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 2},
 
-    "d_ticks_max": {"enabled": True, "low": 0, "high": 4, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
+    "d_ticks_max": {"enabled": True, "low": 0, "high": 4, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
 
-    "vol_per_tick_up_a_mean": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "vol_per_tick_up_a_max": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "vol_per_tick_up_a_sum": {"enabled": True, "low": 0, "high": 400, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "vol_per_tick_dn_a_mean": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "vol_per_tick_dn_a_max": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "vol_per_tick_dn_a_sum": {"enabled": True, "low": 0, "high": 400, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "vol_per_tick_up_b_mean": {"enabled": True, "low": 100, "high": 1000, "gamma": 2.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "vol_per_tick_up_b_max": {"enabled": True, "low": 0, "high": 100, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "vol_per_tick_up_b_sum": {"enabled": True, "low": 0, "high": 4000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "vol_per_tick_dn_b_mean": {"enabled": True, "low": 0, "high": 2000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "vol_per_tick_dn_b_max": {"enabled": True, "low": 0, "high": 2000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "vol_per_tick_dn_b_sum": {"enabled": True, "low": 0, "high": 4000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
+    "vol_per_tick_up_a_mean": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
+    "vol_per_tick_up_a_max": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
+    "vol_per_tick_up_a_sum": {"enabled": True, "low": 0, "high": 400, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
+    "vol_per_tick_dn_a_mean": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
+    "vol_per_tick_dn_a_max": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
+    "vol_per_tick_dn_a_sum": {"enabled": True, "low": 0, "high": 400, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
 
-    "buy_share_wdo": {"enabled": True, "low": 0, "high": 1, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
-    "sell_share_wdo": {"enabled": True, "low": 0, "high": 1, "gamma": 1.0, "invert": False, "log": True, "softness": 0.01, "gain": 1.0},
+    "vol_per_tick_up_b_mean": {"enabled": True, "low": 0, "high": 2000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
+    "vol_per_tick_up_b_max": {"enabled": True, "low": 0, "high": 2000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
+    "vol_per_tick_up_b_sum": {"enabled": True, "low": 0, "high": 4000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
+    "vol_per_tick_dn_b_mean": {"enabled": True, "low": 0, "high": 2000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
+    "vol_per_tick_dn_b_max": {"enabled": True, "low": 0, "high": 2000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
+    "vol_per_tick_dn_b_sum": {"enabled": True, "low": 0, "high": 4000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
 
-    "ease_of_move_a": {"enabled": True, "low": -1000, "high": 1000, "gamma": 1.0, "invert": False, "log": False, "softness": 0.1, "gain": 1.0},
-    "ease_of_move_b": {"enabled": True, "low": -3000, "high": 3000, "gamma": 1.0, "invert": False, "log": False, "softness": 0.1, "gain": 1.0},
+    "buy_share_wdo": {"enabled": True, "low": 0, "high": 1, "gamma": 1, "invert": False, "log": True, "log_scale": 0.02, "skew":  0.0,  "softness": 2},
+    "sell_share_wdo":{"enabled": True, "low": 0, "high": 1, "gamma": 1, "invert": False, "log": True, "log_scale": 0.02, "skew":  0.0,  "softness": 2},
 
-    "absorption_buy_a": {"enabled": True, "low": 0, "high": 500, "gamma": 1.0, "invert": False, "log": False, "softness": 0.1, "gain": 1.4},
-    "absorption_sell_a": {"enabled": True, "low": 0, "high": 500, "gamma": 1.0, "invert": False, "log": False, "softness": 0.1, "gain": 1.4},
-    "absorption_buy_b": {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": False, "softness": 0.1, "gain": 1.4},
-    "absorption_sell_b": {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": False, "softness": 0.1, "gain": 1.4},
+    "ease_of_move_a": {"enabled": True, "low": -500, "high": 500,  "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 2},
+    "ease_of_move_b": {"enabled": True, "low": -3000, "high": 3000, "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 2},
 
-    "topB_buy_vol_a": {"enabled": True, "low": 0, "high": 1000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "topB_sell_vol_a": {"enabled": True, "low": 0, "high": 1000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "topS_buy_vol_a": {"enabled": True, "low": 0, "high": 1000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "topS_sell_vol_a": {"enabled": True, "low": 0, "high": 1000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
+    "absorption_buy_a": {"enabled": True, "low": 100, "high": 500, "gamma": 1.0, "invert": False, "log": False, "log_scale": 1, "skew":  -10.0,  "softness": 1},
+    "absorption_sell_a": {"enabled": True, "low": 100, "high": 500, "gamma": 1.0, "invert": False, "log": False, "log_scale": 1, "skew":  -10.0,  "softness": 1},
+    "absorption_buy_b": {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+    "absorption_sell_b": {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
+
+    "topB_buy_vol_a": {"enabled": True, "low": 0, "high": 800, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1.5},
+    "topB_sell_vol_a":{"enabled": True, "low": 0, "high": 800, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1.5},
+    "topS_buy_vol_a": {"enabled": True, "low": 0, "high": 800, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1.5},
+    "topS_sell_vol_a":{"enabled": True, "low": 0, "high": 800, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1.5},
     
-    "topB_buy_vol_b": {"enabled": True, "low": 0, "high": 5000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "topB_sell_vol_b": {"enabled": True, "low": 0, "high": 5000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "topS_buy_vol_b": {"enabled": True, "low": 0, "high": 5000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-    "topS_sell_vol_b": {"enabled": True, "low": 0, "high": 5000, "gamma": 1.0, "invert": False, "log": True, "softness": 0.1, "gain": 1.0},
-
+    "topB_buy_vol_b":  {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 100, "skew":  0.0,  "softness": 1.5},
+    "topB_sell_vol_b": {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 100, "skew":  0.0,  "softness": 1.5},
+    "topS_buy_vol_b":  {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 100, "skew":  0.0,  "softness": 1.5},
+    "topS_sell_vol_b": {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 100, "skew":  0.0,  "softness": 1.5},
 }
 # Cópia direta e [0,1]→[-1,1]
 SKIP_NORM: Iterable[str]  = {"pctx0", "pctx1", "pctx2", "pctx3", "pctx4"}
 SHARE_FEATS: Iterable[str] = {}
 
-# === DYNAMIC PARAMS =========================================================
-
-def _compute_dynamic_params(X: np.ndarray) -> Tuple[Dict[str, float], Dict[str, bool]]:
-    feat_scale: Dict[str, float] = {}
-    feat_use_log: Dict[str, bool] = {}
-    n_features = X.shape[1]
-    for idx in range(n_features):
-        feat = FEATURE_ORDER[idx]
-        # Se manual estiver habilitado, não calcula dinâmico
-        if MANUAL_NORM_CONF.get(feat, {}).get("enabled", False):
-            continue
-        if feat in SKIP_NORM or feat in SHARE_FEATS:
-            continue
-        col = _finite(X[:, idx].astype(float))
-        if col.size == 0:
-            feat_scale[feat] = 1.0
-            feat_use_log[feat] = False
-            continue
-        if np.min(col) < 0.0:
-            scale = float(np.percentile(np.abs(col), 95))
-            feat_scale[feat] = scale if scale > 0 else 1.0
-            feat_use_log[feat] = False
-        else:
-            p95 = float(np.percentile(col, 95))
-            mx  = float(np.max(col))
-            if p95 > 0.0 and mx > 2.0 * p95:
-                arr_log = np.log1p(np.clip(col, 0.0, None))
-                scale = float(np.percentile(arr_log, 95))
-                feat_scale[feat] = scale if scale > 0 else 1.0
-                feat_use_log[feat] = True
-            else:
-                feat_scale[feat] = p95 if p95 > 0 else 1.0
-                feat_use_log[feat] = False
-    return feat_scale, feat_use_log
-
 # === MANUAL NORMALIZATION ===================================================
+def _apply_manual_norm(x: np.ndarray, conf: Dict[str, Any]) -> np.ndarray:
+    
+    x = x.astype(np.float32)
 
-def _resolve_bounds(col_raw: np.ndarray, conf: Dict[str, Any], use_log: bool) -> Tuple[float, float, np.ndarray]:
-    """Resolve low/high a partir de valores fixos ou percentis; aplica winsor se pedido."""
-    col_finite = _finite(col_raw.astype(float))
+    low, high = conf["low"], conf["high"]
 
-    # Winsorização opcional (no domínio bruto)
-    winsor_pct = float(conf.get("winsor_pct", 0.0))
-    if winsor_pct > 0.0:
-        col_w = _winsorize(col_finite, winsor_pct, 100.0 - winsor_pct)
-    else:
-        col_w = col_finite
+    # 1) log opcional
+    if conf.get("log", False):
+        s = conf.get("log_scale", 1.0)
+        x = np.log1p(x / s)
+        low = np.log1p(max(low, 0) / s)
+        high = np.log1p(max(high, 0) / s)
 
-    # Deriva limites por percentil ou usa low/high fixos
-    if "p_low" in conf and "p_high" in conf:
-        lo_raw = float(np.nanpercentile(col_w, conf["p_low"]))
-        hi_raw = float(np.nanpercentile(col_w, conf["p_high"]))
-    else:
-        lo_raw = float(conf.get("low", np.nanpercentile(col_w, 5.0)))
-        hi_raw = float(conf.get("high", np.nanpercentile(col_w, 95.0)))
+    den = high - low
 
-    if use_log:
-        lo_proc = np.log1p(max(lo_raw, 0.0))
-        hi_proc = np.log1p(max(hi_raw, 0.0))
-        col_proc = np.log1p(np.clip(col_raw.astype(float), 0.0, None))
-    else:
-        lo_proc = lo_raw
-        hi_proc = hi_raw
-        col_proc = col_raw.astype(float)
+    # 2) escala para [-1, 1]
+    y = 2.0 * ((x - low) / den) - 1.0
 
-    # Evita divisão por zero
-    if hi_proc <= lo_proc:
-        hi_proc = lo_proc + 1e-6
-    return lo_proc, hi_proc, col_proc
+    # 3) tanh para suavizar bordas
+    softness = conf.get("softness", 1.0)
+    y = np.tanh(softness * y)
 
-def _apply_manual_norm(col: np.ndarray, conf: Dict[str, Any]) -> np.ndarray:
-    """
-    Agora com:
-      - percentis para limites
-      - winsor opcional
-      - soft-clamp nas pontas
-      - ganho linear (ou alvo de std) sem mexer no gamma
-    """
-    gamma   = float(conf.get("gamma", 1.0))
-    invert  = bool(conf.get("invert", False))
-    use_log = bool(conf.get("log", False))
-    softness = float(conf.get("softness", 0.0))
-    gain     = float(conf.get("gain", 1.0))
-    target_std = conf.get("target_std", None)
+    # 4) skew logarítmico
+    skew = conf.get("skew", 0.0)
+    if skew != 0.0:
+        alpha = abs(skew)
+        p = 0.5 * (y + 1.0)
+        if skew > 0:
+            p = 1.0 - np.log1p(alpha * (1.0 - p)) / np.log1p(alpha)
+        else:
+            p = np.log1p(alpha * p) / np.log1p(alpha)
+        y = 2.0 * p - 1.0
 
-    low_proc, high_proc, col_proc = _resolve_bounds(col, conf, use_log)
-
-    # Linear [low, high] → [0,1] (sem clamp)
-    denom = (high_proc - low_proc)
-    scaled = (col_proc - low_proc) / denom
-
-    # Ajuste de ganho em torno do centro para expandir/contrair sem tocar gamma
-    # Se target_std informado, estima um ganho básico (antes de soft e gamma).
-    if target_std is not None:
-        # estimativa usando mapeamento linear centrado
-        base_centered = (scaled - 0.5) * 2.0
-        std0 = float(np.nanstd(base_centered))
-        if std0 > 1e-9:
-            gain_est = float(target_std) / std0
-            # limites razoáveis pro ganho automático
-            gain = np.clip(gain_est, 0.5, 5.0)
-    if gain != 1.0:
-        scaled = 0.5 + (scaled - 0.5) * gain
-
-    # Soft-clamp para [0,1] com bordas suaves
-    scaled = _soft_clamp01(scaled, softness)
-
-    # [0,1] → [-1,1]
-    mapped = scaled * 2.0 - 1.0
-    if invert:
-        mapped = -mapped
-
-    # Curvatura por gamma (preserva sinal)
+    # 5) gamma
+    gamma = conf.get("gamma", 1.0)
     if gamma != 1.0:
-        mapped = np.sign(mapped) * (np.abs(mapped) ** gamma)
+        y = np.sign(y) * (np.abs(y) ** gamma)
 
-    return mapped.astype(np.float32)
+    # 6) inversão
+    if conf.get("invert", False):
+        y = -y
 
-# === DYNAMIC NORMALIZATION ==================================================
-
-def _apply_dynamic_norm(col: np.ndarray, scale: float, use_log: bool) -> np.ndarray:
-    if scale <= 0.0:
-        scale = 1.0
-    colp = np.log1p(np.clip(col.astype(float), 0.0, None)) if use_log else col.astype(float)
-    return np.tanh(colp / scale).astype(np.float32)
-
-# === PUBLIC API =============================================================
+    return np.clip(y, -1.0, 1.0).astype(np.float32)
 
 def normalize_matrix(X: np.ndarray) -> np.ndarray:
     if X.shape[1] != len(FEATURE_ORDER):
         raise ValueError(f"Expected {len(FEATURE_ORDER)} features but got {X.shape[1]}")
-
-    feat_scale, feat_use_log = _compute_dynamic_params(X)
     Y = np.empty_like(X, dtype=np.float32)
-
     for j, feat in enumerate(FEATURE_ORDER):
         col = X[:, j]
-
         if feat in SKIP_NORM:
             Y[:, j] = col.astype(np.float32)
             continue
-
-        if feat in SHARE_FEATS:
-            y = 2.0 * col - 1.0
-            np.clip(y, -1.0, 1.0, out=y)
-            Y[:, j] = y.astype(np.float32)
-            continue
-
         conf = MANUAL_NORM_CONF.get(feat, {})
         if conf.get("enabled", False):
             Y[:, j] = _apply_manual_norm(col, conf)
         else:
-            scale = feat_scale.get(feat, 1.0)
-            use_log = feat_use_log.get(feat, False)
-            Y[:, j] = _apply_dynamic_norm(col, scale, use_log)
-
+            # sem dinâmica: copia “as is” se não tiver config manual
+            Y[:, j] = col.astype(np.float32)
     return Y
 
 def normalize_matrix_file(input_path: Path, output_path: Path | None = None) -> Path:
@@ -331,7 +235,7 @@ def normalize_directory(data_dir: Path, pattern: str = "*.npy") -> None:
             print(f"[erro] failed to normalise {path.name}: {exc}")
 
 if __name__ == "__main__":
-    days = ["20200309", "20200310", "20200311", "20200312", "20200313", "20200316"]
+    days = ["20250314", "20250310", "20250311", "20250312", "20250313"]
     for x in days:
         input_path = Path(rf"E:\Mercado BMF&BOVESPA\tryd\eventos_processados\{x}_wdo_dol.npy")
         output_path = input_path.with_name(input_path.stem + "_norm.npy")
