@@ -175,13 +175,13 @@ if __name__ == "__main__":
 
     # Diretório onde ficam os .npz (ajuste conforme necessário). Em ambiente local
     # definimos como o diretório atual para facilitar a execução.
-    DATA_DIR  = Path(r"E:\Mercado BMF&BOVESPA\tryd\consolidados_npz")
+    DATA_DIR  = Path(r"C:\Users\Aldair\Desktop\consolidados_npz")
     DAY       = "20250912"
     PAIR      = ("wdo", "dol")   # ou 
     # PAIR      = ("win", "ind")   # ou 
-    out_dir = Path(r"E:\Mercado BMF&BOVESPA\tryd\eventos_processados")
+    out_dir = Path(r"C:\Users\Aldair\Desktop\eventos_processados")
     out_dir.mkdir(parents=True, exist_ok=True)
-
+    
     ############################
     # eventos, sec_a, sec_b = process_day(DATA_DIR, DAY, PAIR, imprimir=False)
     # # imprime estatísticas resumidas dos eventos
@@ -197,6 +197,6 @@ if __name__ == "__main__":
         realtime_process(PAIR)
 
     else:
-        startdate = "20250308"
-        enddate = "20250316"
+        startdate = "20180101"
+        enddate = "20251231"
         process_all(DATA_DIR, PAIR, startdate, enddate, out_dir, n_workers=None) 

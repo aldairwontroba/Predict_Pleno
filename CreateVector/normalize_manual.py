@@ -34,49 +34,6 @@ FEATURE_ORDER: Tuple[str, ...] = (
     "topS_buy_vol_b", "topS_sell_vol_b",
 )
 
-# === HELPERS ================================================================
-def _soft_clamp01(z: np.ndarray, softness: float) -> np.ndarray:
-    """
-    Aproxima clip(z, 0, 1) com transição suave.
-    Usa fórmula estável para evitar overflow em exp().
-    """
-    if softness <= 0.0:
-        return np.clip(z, 0.0, 1.0, out=z)
-
-    s = float(softness)
-    # Evita exp muito grandes: corta a entrada em ±L (L~60 => exp(L) ~ 1e26)
-    L = 60.0
-    z1 = np.clip(z / s, -L, L)
-    z2 = np.clip((z - 1.0) / s, -L, L)
-
-    # softplus(x) = log(1 + exp(x))
-    sp1 = np.log1p(np.exp(z1))
-    sp2 = np.log1p(np.exp(z2))
-    return s * (sp1 - sp2)
-
-def _winsorize(col: np.ndarray, p_low: float, p_high: float) -> np.ndarray:
-    lo = float(np.nanpercentile(col, p_low))
-    hi = float(np.nanpercentile(col, p_high))
-    if hi <= lo:
-        return np.clip(col, lo, lo)
-    return np.clip(col, lo, hi)
-
-def _finite(col: np.ndarray) -> np.ndarray:
-    m = np.isfinite(col)
-    return col[m] if np.any(m) else np.array([0.0], dtype=float)
-
-# === CONFIG =================================================================
-# Regra: defina todas as features aqui. Use "enabled=False" para delegar ao
-# fluxo dinâmico. Quando quiser manual, coloque enabled=True e preencha.
-# Novos campos:
-# - p_low/p_high   : percentis (0..100) para derivar low/high dos dados
-# - winsor_pct     : winsorização simétrica (ex.: 1 -> 1% e 99%)
-# - softness       : 0 = clamp duro; 0.02~0.05 costuma ir bem
-# - gain           : ganho linear em torno do centro (aumenta std sem mexer no gamma)
-# - target_std     : calcula um gain aproximado para atingir este std (aplicado antes do soft-clamp)
-# - log            : bool (usa log1p para dados positivos)
-# - gamma/invert   : igual ao seu código anterior
-
 MANUAL_NORM_CONF: Dict[str, Dict[str, Any]] = {
 
     "dt":   {"enabled": True,  "low":    3, "high":  40,  "gamma": 1,  "invert": False, "log":  True, "log_scale": 0.1, "skew": -1.0,  "softness": 1},
@@ -91,57 +48,44 @@ MANUAL_NORM_CONF: Dict[str, Dict[str, Any]] = {
     "d30m":   {"enabled": True,  "low": -10.0, "high": 10.0,  "gamma": 1,  "invert": False, "log": False,  "log_scale": 0.1, "skew":  0.0,  "softness": 1},
     "rng":    {"enabled": True,  "low":   0.5,  "high": 3.0,  "gamma": 1, "invert": False, "log": False,  "log_scale": 0.1, "skew":  0.0,  "softness": 1},
     "efrang": {"enabled": True,  "low":   0.0,  "high": 1.0,  "gamma": 1, "invert": False, "log": False,  "log_scale": 0.1, "skew":  0.0,  "softness": 1},
-
     "b_vol":   {"enabled": True, "low": 0,     "high": 3000, "gamma": 0.7, "invert": False, "log": True, "log_scale": 20, "skew":  100.0,  "softness": 2},
     "s_vol":   {"enabled": True, "low": 0,     "high": 3000, "gamma": 0.7, "invert": False, "log": True, "log_scale": 20, "skew":  100.0,  "softness": 2},
     "t_vol":   {"enabled": True, "low": 1000,  "high": 10000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
     "d_vol":   {"enabled": True, "low": -5000, "high":  5000, "gamma": 0.7, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
     "avg_vol": {"enabled": True, "low": 5,     "high":    95, "gamma": 0.7, "invert": False, "log":  True, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
-
     "g_b": {"enabled": True, "low": 5, "high": 50, "gamma": 1.0, "invert": False, "log": True, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
     "g_s": {"enabled": True, "low": 5, "high": 50, "gamma": 1.0, "invert": False, "log": True, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
     "g_n": {"enabled": True, "low": 2, "high": 30, "gamma": 1.0, "invert": False, "log": True, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
-
     "rate_avg": {"enabled": True, "low": 5, "high": 95, "gamma": 1.0, "invert": False, "log": True, "log_scale": 0.1, "skew":  0.0,  "softness": 1.5},
-    
     "max_streak_buy": {"enabled": True, "low": 0, "high": 10, "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
     "max_streak_sell": {"enabled": True, "low": 0, "high": 10, "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
-
     "ema_vol_total": {"enabled": True, "low": 200, "high": 800, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  1.0,  "softness": 1},
     "ema_order_rate": {"enabled": True, "low": 5, "high": 66, "gamma": 1, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 2},
-
     "d_ticks_max": {"enabled": True, "low": 0, "high": 4, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
-
     "vol_per_tick_up_a_mean": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
     "vol_per_tick_up_a_max": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
     "vol_per_tick_up_a_sum": {"enabled": True, "low": 0, "high": 400, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
     "vol_per_tick_dn_a_mean": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
     "vol_per_tick_dn_a_max": {"enabled": True, "low": 0, "high": 200, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
     "vol_per_tick_dn_a_sum": {"enabled": True, "low": 0, "high": 400, "gamma": 1.0, "invert": False, "log": True, "log_scale": 1, "skew":  0.0,  "softness": 1},
-
     "vol_per_tick_up_b_mean": {"enabled": True, "low": 0, "high": 2000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
     "vol_per_tick_up_b_max": {"enabled": True, "low": 0, "high": 2000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
     "vol_per_tick_up_b_sum": {"enabled": True, "low": 0, "high": 4000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
     "vol_per_tick_dn_b_mean": {"enabled": True, "low": 0, "high": 2000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
     "vol_per_tick_dn_b_max": {"enabled": True, "low": 0, "high": 2000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
     "vol_per_tick_dn_b_sum": {"enabled": True, "low": 0, "high": 4000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1},
-
     "buy_share_wdo": {"enabled": True, "low": 0, "high": 1, "gamma": 1, "invert": False, "log": True, "log_scale": 0.02, "skew":  0.0,  "softness": 2},
     "sell_share_wdo":{"enabled": True, "low": 0, "high": 1, "gamma": 1, "invert": False, "log": True, "log_scale": 0.02, "skew":  0.0,  "softness": 2},
-
     "ease_of_move_a": {"enabled": True, "low": -500, "high": 500,  "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 2},
     "ease_of_move_b": {"enabled": True, "low": -3000, "high": 3000, "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 2},
-
     "absorption_buy_a": {"enabled": True, "low": 100, "high": 500, "gamma": 1.0, "invert": False, "log": False, "log_scale": 1, "skew":  -10.0,  "softness": 1},
     "absorption_sell_a": {"enabled": True, "low": 100, "high": 500, "gamma": 1.0, "invert": False, "log": False, "log_scale": 1, "skew":  -10.0,  "softness": 1},
     "absorption_buy_b": {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
     "absorption_sell_b": {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": False, "log_scale": 0.1, "skew":  0.0,  "softness": 1},
-
     "topB_buy_vol_a": {"enabled": True, "low": 0, "high": 800, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1.5},
     "topB_sell_vol_a":{"enabled": True, "low": 0, "high": 800, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1.5},
     "topS_buy_vol_a": {"enabled": True, "low": 0, "high": 800, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1.5},
     "topS_sell_vol_a":{"enabled": True, "low": 0, "high": 800, "gamma": 1.0, "invert": False, "log": True, "log_scale": 10, "skew":  0.0,  "softness": 1.5},
-    
     "topB_buy_vol_b":  {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 100, "skew":  0.0,  "softness": 1.5},
     "topB_sell_vol_b": {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 100, "skew":  0.0,  "softness": 1.5},
     "topS_buy_vol_b":  {"enabled": True, "low": 0, "high": 3000, "gamma": 1.0, "invert": False, "log": True, "log_scale": 100, "skew":  0.0,  "softness": 1.5},
@@ -235,8 +179,11 @@ def normalize_directory(data_dir: Path, pattern: str = "*.npy") -> None:
             print(f"[erro] failed to normalise {path.name}: {exc}")
 
 if __name__ == "__main__":
-    days = ["20250314", "20250310", "20250311", "20250312", "20250313"]
-    for x in days:
-        input_path = Path(rf"E:\Mercado BMF&BOVESPA\tryd\eventos_processados\{x}_wdo_dol.npy")
-        output_path = input_path.with_name(input_path.stem + "_norm.npy")
-        normalize_matrix_file(input_path, output_path)
+    datadir = Path(r"C:\Users\Aldair\Desktop\eventos_processados")
+    normalize_directory(data_dir=datadir)
+
+    # days = ["20250314", "20250310", "20250311", "20250312", "20250313"]
+    # for x in days:
+    #     input_path = Path(rf"E:\Mercado BMF&BOVESPA\tryd\eventos_processados\{x}_wdo_dol.npy")
+    #     output_path = input_path.with_name(input_path.stem + "_norm.npy")
+    #     normalize_matrix_file(input_path, output_path)
