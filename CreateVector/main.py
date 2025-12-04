@@ -22,7 +22,7 @@ def _process_one_day_worker(day_entry: Dict[str, Path], pair: Tuple[str, str], o
     day_str = str(day_entry.get("day", ""))
     return day_str, len(eventos)
 
-def realtime_process(pair: Tuple[str, str]):
+def realtime_process(pair: Tuple[str, str], on_event=None):
     import ctypes
     import mmap
     import time
@@ -134,7 +134,8 @@ def realtime_process(pair: Tuple[str, str]):
 
             # imprime qualquer evento finalizado neste passo (normalmente 0 ou 1)
             for ev in events_done:
-                print_event(ev)
+                if on_event is not None:
+                    on_event(ev)   # <-- chama quem sabe transformar ev em token + rodar modelo
         
         win32event.ResetEvent(event_handle)
 

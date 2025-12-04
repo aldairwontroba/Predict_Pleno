@@ -90,10 +90,7 @@ venv.bak/
 .env.*
 
 # Model files / checkpoints
-*.pkl
 *.joblib
-*.pt
-*.h5
 *.ckpt
 
 # MacOS

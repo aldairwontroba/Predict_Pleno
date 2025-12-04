@@ -51,6 +51,10 @@ def main():
     print("[INFO] Fitando scaler do scikit-learn no conjunto combinado...")
     scaler = SCALER
     scaler.fit(Yfit)
+    import joblib
+    joblib.dump(scaler, "scaler_norm2.pkl")
+    print("[OK] scaler salvo em scaler_norm2.pkl")
+
 
     print("[INFO] Transformando e salvando...")
     for f in files:
