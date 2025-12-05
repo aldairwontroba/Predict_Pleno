@@ -31,4 +31,4 @@ class RealTimeVQTokenizer:
         z_e = self.model.encoder(x)
         _, codes, _ = self.model.vq(z_e)
 
-        return int(codes.view(-1)[0].item())
+        return int(codes[0].view(-1).item())

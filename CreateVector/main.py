@@ -9,9 +9,9 @@ parent_dir = os.path.dirname(current_dir)
 if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 
-from segmentation import SegParams, EventSegmenter
-from data_processing import process_day, find_files_for_pair
-from plotting import print_event_stats, print_event, _build_event_sec_map, _tick_series_time, _plot_segments_time
+from CreateVector.segmentation import SegParams, EventSegmenter
+from CreateVector.data_processing import process_day, find_files_for_pair
+from CreateVector.plotting import print_event_stats, print_event, _build_event_sec_map, _tick_series_time, _plot_segments_time
 
 def _process_one_day_worker(day_entry: Dict[str, Path], pair: Tuple[str, str], out_dir: Path) -> Tuple[str, int]:
     """

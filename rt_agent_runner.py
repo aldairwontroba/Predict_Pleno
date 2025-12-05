@@ -16,8 +16,6 @@ from build_agent_sequences import (
     TransformerConfig,
     _is_last_business_day_of_month,
 )
-from validate_sft import generate_autoregressive_from_prefix  # reaproveitado
-
 # ------------------------------------------------------------------
 # Contexto em tempo real (usa dia/hora atual e mantém posição = FLAT)
 # ------------------------------------------------------------------
@@ -80,6 +78,32 @@ def compute_rt_context_tokens(
 
     return torch.tensor(tokens, dtype=torch.long)
 
+@torch.no_grad()
+def generate_autoregressive_from_prefix(
+    model: torch.nn.Module,
+    x_prefix: torch.Tensor,  # (1, L0) ou (L0,)
+    device: torch.device,
+    T: int,
+) -> torch.Tensor:
+    """
+    Versão simples para uso em tempo real:
+    - começa de x_prefix
+    - gera autoregressivo até ter comprimento T
+    - retorna tensor (1, T)
+    """
+    if x_prefix.dim() == 1:
+        x_gen = x_prefix.unsqueeze(0).to(device)
+    else:
+        x_gen = x_prefix.to(device)
+
+    model.eval()
+
+    while x_gen.size(1) < T:
+        logits = model(x_gen)  # [1, L, V]
+        next_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [1,1]
+        x_gen = torch.cat([x_gen, next_id], dim=1)
+
+    return x_gen
 
 # ------------------------------------------------------------------
 # Runner em tempo real
@@ -142,7 +166,7 @@ class RealTimeAgentRunner:
 
         self.past_tokens.append(tok)
 
-        if len(self.past_tokens) < self.win_cfg.n_past_tokens:
+        if len(self.past_tokens) < 16: #self.win_cfg.n_past_tokens:
             # ainda montando histórico suficiente
             return
 
@@ -208,7 +232,7 @@ class RealTimeAgentRunner:
 
         print("================================================")
         print(f"[RT] now={now}")
-        print("[RT] FUT tokens (primeiros 10):", fut_tokens[:10], "...")
+        print("[RT] FUT tokens (primeiros 10):", fut_tokens[:20], "...")
         print("[RT] ANALYSIS tokens:", ana_tokens)
         print("[RT] ACTION tokens:", act_tokens)
         # aqui depois você pluga o decodificador BUY/SELL/HOLD

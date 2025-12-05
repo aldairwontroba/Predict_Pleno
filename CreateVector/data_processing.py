@@ -3,8 +3,8 @@ from pathlib import Path
 from typing import Dict, Tuple, List, Optional, Iterable, Any
 import numpy as np
 
-from segmentation import EventSegmenter, SegParams
-from plotting import print_event
+from CreateVector.segmentation import EventSegmenter, SegParams
+from CreateVector.plotting import print_event
 
 def lot_multiplier(sym: str) -> float:
     return 5.0 if sym.lower() in ("dol", "ind") else 1.0

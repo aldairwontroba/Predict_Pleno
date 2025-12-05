@@ -40,13 +40,12 @@ class RealTimeNormalizer:
         - normalização manual
         - normalização sklearn (global)
         """
-        # (59,) → (45,)  seleciona features usadas no treino
-        vec_sel = vec_raw[self.idx_used]
-
+        
         # manual normalization (igual treino)
-        x = normalize_matrix(vec_sel[None, :])   # (1,45)
+        x = normalize_matrix(vec_raw[None, :])   # (1,59)
 
         # sklearn normalization
-        x2 = self.scaler.transform(x)            # (1,45)
+        x2 = self.scaler.transform(x)            # (1,59)
 
-        return x2[0]   # volta para (45,)
+        # (59,) → (45,)  seleciona features usadas no treino
+        return x2[0, self.idx_used]   # volta para (45,)
