@@ -79,29 +79,126 @@ def compute_rt_context_tokens(
     return torch.tensor(tokens, dtype=torch.long)
 
 @torch.no_grad()
-def generate_autoregressive_from_prefix(
+def _top_p_filtering(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    # logits: [V]
+    if top_p >= 1.0:
+        return logits
+    sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+    probs = torch.softmax(sorted_logits, dim=-1)
+    cum = torch.cumsum(probs, dim=-1)
+
+    # remove tudo depois do cutoff
+    cutoff = cum > top_p
+    cutoff[0] = False  # garante ao menos 1 token
+    sorted_logits[cutoff] = -float("inf")
+
+    # volta para a ordem original
+    out = torch.full_like(logits, -float("inf"))
+    out[sorted_idx] = sorted_logits
+    return out
+
+def _top_k_filtering(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+    if top_k is None or top_k <= 0:
+        return logits
+    v, _ = torch.topk(logits, k=min(top_k, logits.numel()))
+    thr = v[-1]
+    return torch.where(logits >= thr, logits, torch.full_like(logits, -float("inf")))
+
+def _sample_next(
+    logits_last: torch.Tensor,          # [V]
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    forbid_token: int | None = None,    # bloqueia repetir exatamente o último
+) -> int:
+    if temperature <= 0:
+        # fallback: greedy
+        if forbid_token is not None:
+            logits_last = logits_last.clone()
+            logits_last[forbid_token] = -float("inf")
+        return int(torch.argmax(logits_last).item())
+
+    x = logits_last / float(temperature)
+
+    if forbid_token is not None:
+        x = x.clone()
+        x[forbid_token] = -float("inf")
+
+    x = _top_k_filtering(x, top_k)
+    x = _top_p_filtering(x, top_p)
+
+    probs = torch.softmax(x, dim=-1)
+    # segurança: se ficou tudo -inf
+    if not torch.isfinite(probs).any() or float(probs.sum()) <= 0:
+        return int(torch.argmax(logits_last).item())
+
+    return int(torch.multinomial(probs, num_samples=1).item())
+
+@torch.no_grad()
+def generate_autoregressive_from_prefix_rt(
     model: torch.nn.Module,
-    x_prefix: torch.Tensor,  # (1, L0) ou (L0,)
+    x_prefix: torch.Tensor,             # (1, L0)
     device: torch.device,
     T: int,
+    layout: dict,                       # win_cfg.layout()
+    tok_cfg,                            # TokenConfig
+    # --- knobs ---
+    fut_temperature: float = 1.05,
+    fut_top_p: float = 0.92,
+    fut_top_k: int = 0,
+    ana_temperature: float = 0.85,
+    ana_top_p: float = 1.0,
+    ana_top_k: int = 0,
+    action_greedy: bool = True,
+    no_repeat_last_in_fut: bool = True,
 ) -> torch.Tensor:
     """
-    Versão simples para uso em tempo real:
-    - começa de x_prefix
-    - gera autoregressivo até ter comprimento T
-    - retorna tensor (1, T)
+    Gera até T, mas:
+      - FUT: sampling (top-p/top-k + temperature) para evitar colapso em self-loop
+      - ANALYSIS: sampling leve (opcional)
+      - ACTION: greedy (por padrão)
     """
-    if x_prefix.dim() == 1:
-        x_gen = x_prefix.unsqueeze(0).to(device)
-    else:
-        x_gen = x_prefix.to(device)
+    assert x_prefix.dim() == 2 and x_prefix.size(0) == 1
 
+    x_gen = x_prefix.to(device)
     model.eval()
 
+    fut_s, fut_e = layout["fut"]
+    ana_s, ana_e = layout["analysis"]
+    act_s, act_e = layout["action"]
+
     while x_gen.size(1) < T:
-        logits = model(x_gen)  # [1, L, V]
-        next_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [1,1]
-        x_gen = torch.cat([x_gen, next_id], dim=1)
+        logits = model(x_gen)                 # [1, L, V]
+        logits_last = logits[0, -1, :]        # [V]
+        cur_pos = x_gen.size(1)               # próxima posição a gerar (0-indexed)
+
+        last_token = int(x_gen[0, -1].item())
+        forbid = last_token if (no_repeat_last_in_fut and (fut_s <= cur_pos < fut_e)) else None
+
+        # Decide modo por seção
+        if fut_s <= cur_pos < fut_e:
+            next_id = _sample_next(
+                logits_last,
+                temperature=fut_temperature,
+                top_p=fut_top_p,
+                top_k=fut_top_k,
+                forbid_token=forbid,
+            )
+        elif ana_s <= cur_pos < ana_e:
+            next_id = _sample_next(
+                logits_last,
+                temperature=ana_temperature,
+                top_p=ana_top_p,
+                top_k=ana_top_k,
+                forbid_token=None,
+            )
+        elif act_s <= cur_pos < act_e and action_greedy:
+            next_id = int(torch.argmax(logits_last).item())
+        else:
+            # fallback (greedy)
+            next_id = int(torch.argmax(logits_last).item())
+
+        x_gen = torch.cat([x_gen, torch.tensor([[next_id]], device=device, dtype=torch.long)], dim=1)
 
     return x_gen
 
@@ -212,12 +309,22 @@ class RealTimeAgentRunner:
         T_target = action_end  # posição final (exclusive) da janela
 
         # gera autoregressivo usando a mesma função que você já validou
-        x_gen = generate_autoregressive_from_prefix(
+        x_gen = generate_autoregressive_from_prefix_rt(
             model=self.model,
             x_prefix=x_prefix,
             device=self.device,
             T=T_target,
-        )  # (1, T_target)
+            layout=self.layout,
+            tok_cfg=self.tok_cfg,
+            fut_temperature=1.05,
+            fut_top_p=0.92,
+            fut_top_k=0,            # ou 100 se quiser top-k
+            ana_temperature=0.85,
+            ana_top_p=1.0,
+            ana_top_k=0,
+            action_greedy=True,
+            no_repeat_last_in_fut=True,
+        )
 
         x_gen = x_gen[0].tolist()
 
