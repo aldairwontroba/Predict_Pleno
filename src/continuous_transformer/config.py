@@ -72,7 +72,8 @@ class PretrainConfig:
 
     # Checkpoints
     checkpoint_dir: Path = PATHS.checkpoints / "ct_pretrain"
-    log_interval:   int  = 200            # batches entre logs
+    log_interval:   int  = 50             # batches entre logs
+    save_every:     int  = 3000           # salva pretrain_latest.pt a cada N batches
 
     # Resume: se True, auto-detecta o último checkpoint salvo e continua
     resume: bool = False

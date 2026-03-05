@@ -139,10 +139,14 @@ def train_pretrain(
     # ── Resume ──────────────────────────────────────────────────
     # Aceita: resume_ckpt explícito OU auto-detecta o último checkpoint
     if resume_ckpt is None and train_cfg.resume:
-        # Procura o epoch mais alto já salvo
-        existing = sorted(out_dir.glob("pretrain_epoch_*.pt"))
-        if existing:
-            resume_ckpt = existing[-1]
+        # Prioridade: latest (mid-epoch) > epoch mais alto
+        latest_path = out_dir / "pretrain_latest.pt"
+        if latest_path.exists():
+            resume_ckpt = latest_path
+        else:
+            existing = sorted(out_dir.glob("pretrain_epoch_*.pt"))
+            if existing:
+                resume_ckpt = existing[-1]
 
     if resume_ckpt is not None and Path(resume_ckpt).exists():
         print(f"[PRETRAIN] Retomando de: {resume_ckpt}")
@@ -209,6 +213,28 @@ def train_pretrain(
                 log_loss  = 0.0
                 log_count = 0
 
+            # Checkpoint mid-epoch (sobrescreve pretrain_latest.pt)
+            if train_cfg.save_every > 0 and i % train_cfg.save_every == 0:
+                latest_ckpt = {
+                    "epoch":       epoch,
+                    "model_state": model.state_dict(),
+                    "opt_state":   opt.state_dict(),
+                    "val_loss":    best_val_loss,
+                    "cfg": {
+                        "input_dim":   model_cfg.input_dim,
+                        "num_meta":    model_cfg.num_meta,
+                        "d_model":     model_cfg.d_model,
+                        "n_heads":     model_cfg.n_heads,
+                        "n_layers":    model_cfg.n_layers,
+                        "seq_len":     model_cfg.seq_len,
+                        "dropout":     model_cfg.dropout,
+                        "num_actions": model_cfg.num_actions,
+                    },
+                }
+                torch.save(latest_ckpt, out_dir / "pretrain_latest.pt")
+                now_s = datetime.now().strftime("%H:%M:%S")
+                print(f"[{now_s}] [CKPT-MID] pretrain_latest.pt salvo (ep={epoch}, batch={i})")
+
         # Gradiente acumulado restante
         if (len(dl_train) % accum) != 0:
             if train_cfg.max_grad_norm > 0:
@@ -251,6 +277,10 @@ def train_pretrain(
 
         epoch_path = out_dir / f"pretrain_epoch_{epoch:03d}.pt"
         torch.save(ckpt, epoch_path)
+        # Remove latest mid-epoch (época concluída com sucesso)
+        latest_path = out_dir / "pretrain_latest.pt"
+        if latest_path.exists():
+            latest_path.unlink()
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
