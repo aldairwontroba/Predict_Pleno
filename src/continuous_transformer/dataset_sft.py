@@ -60,7 +60,8 @@ class SFTDataset(Dataset):
             override_dir = Path(data_dir_override)
             remapped = []
             for p in norm_file_paths:
-                fname = Path(p).name          # só o nome do arquivo
+                # Compatível com caminhos Windows (\\) rodando no Linux
+                fname = p.replace("\\", "/").split("/")[-1]
                 remapped.append(str(override_dir / fname))
             norm_file_paths = remapped
             print(f"[SFTDataset] data_dir_override → {override_dir}")
